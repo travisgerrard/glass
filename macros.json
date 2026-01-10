@@ -1,0 +1,41 @@
+{
+  "macros": {
+    "Labs": [
+      "find Chart",
+      "click 1",
+      "find lab",
+      "click 1"
+    ],
+    "Docs": [
+      "find Chart",
+      "click 1",
+      "find Decumentation",
+      "find Documentation",
+      "click 1"
+    ],
+    "Sum": [
+      "find Chart",
+      "click 1",
+      "find Summary",
+      "click 1"
+    ],
+    "sendmsg": [
+      "find To consumer",
+      "click 1",
+      "find Send",
+      "click 1",
+      "find Yes",
+      "click 1"
+    ],
+    "99214": [
+      "find Chart",
+      "click 1",
+      "find Summary",
+      "click 1",
+      "find Charges",
+      "click 1",
+      "find 99214",
+      "click 1"
+    ]
+  }
+}
