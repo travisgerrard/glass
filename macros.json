@@ -36,6 +36,14 @@
       "click 1",
       "find 99214",
       "click 1"
+    ],
+    "mddfu": [
+      "find Document Plan",
+      "click 2",
+      "find plan summerized in",
+      "find Plan summarized in",
+      "click 1",
+      "find-image check"
     ]
   }
 }

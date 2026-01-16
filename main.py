@@ -967,6 +967,10 @@ class AppController(AppKit.NSObject):
         if dest:
             Quartz.CGImageDestinationAddImage(dest, image, None)
             Quartz.CGImageDestinationFinalize(dest)
+        if not os.path.exists(image_path):
+            self.command_bar.show()
+            self.command_bar.set_status(f"Failed to save image: {name}")
+            return
         # Record the find-image step
         self._record_step(f"find-image {name}")
         self.command_bar.show()
@@ -1018,8 +1022,9 @@ class AppController(AppKit.NSObject):
         data = Quartz.CGDataProviderCopyData(data_provider)
         arr = np.frombuffer(data, dtype=np.uint8)
         arr = arr.reshape((height, bytes_per_row // 4, 4))
-        arr = arr[:, :width, :3]  # Drop alpha, trim padding
-        screen_bgr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+        # CGWindowListCreateImage returns BGRA format on macOS (little-endian with alpha first)
+        # Extract first 3 channels to get BGR, which matches cv2.imread format
+        screen_bgr = arr[:, :width, :3].copy()
         # Template matching
         result = cv2.matchTemplate(screen_bgr, template, cv2.TM_CCOEFF_NORMED)
         threshold = 0.8
