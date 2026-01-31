@@ -603,14 +603,22 @@ class RegionSelectWindow:
 
 
 class ScreenOCR:
-    def __init__(self, screen_size_points):
-        self.screen_size_points = screen_size_points
+    def __init__(self):
+        pass
 
-    def capture_primary_display(self):
-        display_id = Quartz.CGMainDisplayID()
-        bounds = Quartz.CGDisplayBounds(display_id)
+    def capture_display(self, display_id, screen_size_points):
+        """Capture a specific display.
+
+        Returns:
+          (cg_image, width_px, height_px, scale, display_bounds_px)
+
+        Notes:
+        - CGDisplayBounds are in *pixel* coordinates in the global display space.
+        - `scale` is pixels-per-point for this capture.
+        """
+        bounds_px = Quartz.CGDisplayBounds(display_id)
         image = Quartz.CGWindowListCreateImage(
-            bounds,
+            bounds_px,
             Quartz.kCGWindowListOptionOnScreenOnly,
             Quartz.kCGNullWindowID,
             Quartz.kCGWindowImageDefault,
@@ -623,13 +631,13 @@ class ScreenOCR:
         if width_px == 0 or height_px == 0:
             raise PermissionError("Screen Recording permission required")
 
-        width_pts, height_pts = self.screen_size_points
+        width_pts, height_pts = screen_size_points
         if width_pts:
             scale = width_px / float(width_pts)
         else:
             scale = 1.0
 
-        return image, width_px, height_px, scale
+        return image, width_px, height_px, scale, bounds_px
 
     def recognize_text(self, cg_image, width_px, height_px, scale):
         request = Vision.VNRecognizeTextRequest.alloc().init()
@@ -679,16 +687,15 @@ class AppController(AppKit.NSObject):
         if self is None:
             return None
 
-        screen = AppKit.NSScreen.mainScreen()
-        self.screen_frame = screen.frame()
-        self.screen_height = self.screen_frame.size.height
-        self.screen_center = (
-            self.screen_frame.size.width / 2.0,
-            self.screen_frame.size.height / 2.0,
-        )
-        self.ocr_engine = ScreenOCR(
-            (self.screen_frame.size.width, self.screen_frame.size.height)
-        )
+        self.ocr_engine = ScreenOCR()
+
+        # Active screen selection (multi-display)
+        self._active_screen_index = 0
+        self._active_display_id = Quartz.CGMainDisplayID()
+        self._display_bounds_px = Quartz.CGDisplayBounds(self._active_display_id)
+        self.capture_origin_pt = (0.0, 0.0)
+
+        self._set_active_screen_by_mouse(fallback_to_main=True)
 
         self.command_bar = CommandBarWindow.alloc().initWithController_screenFrame_(
             self, self.screen_frame
@@ -729,6 +736,97 @@ class AppController(AppKit.NSObject):
         self._load_macros()
         self._setup_hotkey()
         return self
+
+    def _screens(self):
+        # NSScreen frames are in points in a global coordinate space.
+        return list(AppKit.NSScreen.screens() or [])
+
+    def _screen_display_id(self, screen):
+        try:
+            desc = screen.deviceDescription() or {}
+            return int(desc.get("NSScreenNumber"))
+        except Exception:
+            return None
+
+    def _screen_index_for_mouse(self):
+        # NSEvent mouseLocation is in global screen coords (points).
+        pt = AppKit.NSEvent.mouseLocation()
+        screens = self._screens()
+        for idx, s in enumerate(screens):
+            f = s.frame()
+            if (
+                pt.x >= f.origin.x
+                and pt.x < (f.origin.x + f.size.width)
+                and pt.y >= f.origin.y
+                and pt.y < (f.origin.y + f.size.height)
+            ):
+                return idx
+        return None
+
+    def _set_active_screen_by_mouse(self, fallback_to_main=True):
+        idx = self._screen_index_for_mouse()
+        if idx is None and fallback_to_main:
+            idx = 0
+        if idx is None:
+            return
+        self._set_active_screen(idx, announce=False)
+
+    def _set_active_screen(self, index, announce=True):
+        screens = self._screens()
+        if not screens:
+            return
+        if index < 0 or index >= len(screens):
+            if hasattr(self, "command_bar"):
+                self.command_bar.set_status("Invalid screen")
+            return
+
+        screen = screens[index]
+        display_id = self._screen_display_id(screen)
+        if display_id is None:
+            if hasattr(self, "command_bar"):
+                self.command_bar.set_status("Could not resolve display id")
+            return
+
+        # Update active display metadata
+        self._active_screen_index = index
+        self._active_display_id = display_id
+        self._display_bounds_px = Quartz.CGDisplayBounds(display_id)
+
+        # Screen frame is in points.
+        self.screen_frame = screen.frame()
+        self.screen_height = self.screen_frame.size.height
+        self.screen_center = (
+            self.screen_frame.size.width / 2.0,
+            self.screen_frame.size.height / 2.0,
+        )
+
+        # Reset capture state for new screen
+        self.ocr_items = []
+        self.matches = []
+        if hasattr(self, "overlay"):
+            self.overlay.clear()
+
+        # Rebuild windows so they are positioned/sized for the active screen.
+        # During initial init, windows may not exist yet.
+        if hasattr(self, "command_bar") and hasattr(self, "overlay"):
+            was_visible = getattr(self.command_bar, "visible", False)
+            if was_visible:
+                self.command_bar.hide()
+            try:
+                self.overlay.window.orderOut_(None)
+            except Exception:
+                pass
+
+            self.command_bar = CommandBarWindow.alloc().initWithController_screenFrame_(
+                self, self.screen_frame
+            )
+            self.overlay = OverlayWindow.alloc().initWithScreenFrame_(self.screen_frame)
+
+            if announce:
+                self.command_bar.set_status(f"Active screen: {index + 1}/{len(screens)}")
+            if was_visible:
+                self.command_bar.show()
+                self.command_bar.clear_input()
 
     def _setup_hotkey(self):
         mask = Quartz.CGEventMaskBit(Quartz.kCGEventFlagsChanged)
@@ -948,10 +1046,18 @@ class AppController(AppKit.NSObject):
         name = self._pending_image_name
         self._pending_image_name = None
         # Capture the screen and crop to selection
-        display_id = Quartz.CGMainDisplayID()
-        region = Quartz.CGRectMake(x, y, w, h)
+        display_id = self._active_display_id
+        bounds_px = Quartz.CGDisplayBounds(display_id)
+        # Convert selection (points, relative to active screen) to global pixels.
+        scale = bounds_px.size.width / float(self.screen_frame.size.width or 1.0)
+        region_px = Quartz.CGRectMake(
+            bounds_px.origin.x + (x * scale),
+            bounds_px.origin.y + (y * scale),
+            w * scale,
+            h * scale,
+        )
         image = Quartz.CGWindowListCreateImage(
-            region,
+            region_px,
             Quartz.kCGWindowListOptionOnScreenOnly,
             Quartz.kCGNullWindowID,
             Quartz.kCGWindowImageDefault,
@@ -1001,7 +1107,7 @@ class AppController(AppKit.NSObject):
             return
         template_h, template_w = template.shape[:2]
         # Capture screen
-        display_id = Quartz.CGMainDisplayID()
+        display_id = self._active_display_id
         screen_bounds = Quartz.CGDisplayBounds(display_id)
         screen_image = Quartz.CGWindowListCreateImage(
             screen_bounds,
@@ -1336,13 +1442,19 @@ class AppController(AppKit.NSObject):
             self._list_images()
         elif name == "delete-image":
             self._delete_image(arg)
+        elif name == "screens":
+            self._list_screens()
+        elif name == "screen":
+            self._handle_screen_command(arg)
         elif name == "help":
             self.command_bar.set_status("Commands")
             self.command_bar.show_help(
-                "capture  - capture primary screen\n"
+                "capture  - capture active screen\n"
                 "find <text>  - capture + find text\n"
                 "click <number>  - left click match\n"
                 "rclick <number>  - right click match\n"
+                "screens  - list displays\n"
+                "screen <n>|auto  - set active display\n"
                 "clear  - close and reset\n"
                 "record <name>  - start recording\n"
                 "stop  - save recording\n"
@@ -1365,6 +1477,37 @@ class AppController(AppKit.NSObject):
                 self._record_step(f"find {command}")
                 self._handle_find(command)
 
+    def _list_screens(self):
+        screens = self._screens()
+        if not screens:
+            self.command_bar.set_status("No screens detected")
+            self.command_bar.show_help("No screens detected")
+            return
+        lines = []
+        for idx, s in enumerate(screens):
+            f = s.frame()
+            did = self._screen_display_id(s)
+            active = "*" if idx == self._active_screen_index else " "
+            # frame origin can be non-zero in multi-display setups
+            lines.append(
+                f"{active} {idx+1}: {int(f.size.width)}x{int(f.size.height)} pts @ ({int(f.origin.x)},{int(f.origin.y)})  id={did}"
+            )
+        self.command_bar.set_status(f"Screens ({len(screens)})")
+        self.command_bar.show_help("\n".join(lines))
+
+    def _handle_screen_command(self, arg):
+        val = (arg or "").strip().lower()
+        if not val or val == "auto":
+            self._set_active_screen_by_mouse(fallback_to_main=True)
+            self.command_bar.set_status("Active screen: auto (mouse)")
+            return
+        try:
+            idx = int(val) - 1
+        except ValueError:
+            self.command_bar.set_status("Usage: screen <n>|auto")
+            return
+        self._set_active_screen(idx, announce=True)
+
     def _handle_capture(self):
         if self._ocr_in_progress:
             self.command_bar.set_status("Capturing...")
@@ -1379,9 +1522,18 @@ class AppController(AppKit.NSObject):
         def task():
             with objc.autorelease_pool():
                 try:
-                    image, width_px, height_px, scale = (
-                        self.ocr_engine.capture_primary_display()
+                    image, width_px, height_px, scale, bounds_px = (
+                        self.ocr_engine.capture_display(
+                            self._active_display_id,
+                            (self.screen_frame.size.width, self.screen_frame.size.height),
+                        )
                     )
+                    # Store origin (points) in global Quartz space for clicks.
+                    self.capture_origin_pt = (
+                        bounds_px.origin.x / float(scale or 1.0),
+                        bounds_px.origin.y / float(scale or 1.0),
+                    )
+                    self._display_bounds_px = bounds_px
                 except PermissionError:
                     run_on_main(
                         lambda: self.command_bar.set_status(
@@ -1541,7 +1693,10 @@ class AppController(AppKit.NSObject):
         self.command_bar.hide()
 
     def _click_at(self, x, y, button="left"):
-        point = Quartz.CGPointMake(x, y)
+        # `x,y` are in points relative to the *active screen*.
+        # Quartz mouse events expect global display coordinates.
+        ox, oy = getattr(self, "capture_origin_pt", (0.0, 0.0))
+        point = Quartz.CGPointMake(ox + x, oy + y)
         if button == "right":
             event_down = Quartz.CGEventCreateMouseEvent(
                 None, Quartz.kCGEventRightMouseDown, point, Quartz.kCGMouseButtonRight

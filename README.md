@@ -26,6 +26,8 @@ Spotlight-style command bar for capturing the primary display, searching OCR tex
   - `rclick <number>` (right click)
   - `clear`
   - `help`
+  - `screens` (list displays)
+  - `screen <n>|auto` (set active display)
   - `record <name>` (start recording a macro)
   - `stop` (save the current macro)
   - `run <name>`
@@ -36,7 +38,7 @@ Spotlight-style command bar for capturing the primary display, searching OCR tex
 
 ## Notes
 
-- This MVP only supports the primary display.
+- Supports selecting the active display (see `screens` / `screen <n>`).
 - Screen capture uses Quartz `CGWindowListCreateImage` (ScreenCaptureKit omitted for simplicity).
 - If the hotkey does not respond, enable Input Monitoring for your terminal or Python.
 - Match numbering uses closest-first ordering relative to the last click location (fallback: screen center).
