@@ -65,6 +65,11 @@ class CommandInputTextView(AppKit.NSTextView):
         window = self.window()
         if window is not None:
             window.performWindowDragWithEvent_(event)
+            # After dragging, treat the window's screen as the active screen.
+            try:
+                self.controller._sync_active_screen_to_command_bar(announce=True)
+            except Exception:
+                pass
         else:
             AppKit.NSTextView.mouseDragged_(self, event)
 
@@ -690,12 +695,21 @@ class AppController(AppKit.NSObject):
         self.ocr_engine = ScreenOCR()
 
         # Active screen selection (multi-display)
+        # Default: follow wherever the command bar window is.
+        self._follow_command_bar = True
         self._active_screen_index = 0
         self._active_display_id = Quartz.CGMainDisplayID()
         self._display_bounds_px = Quartz.CGDisplayBounds(self._active_display_id)
         self.capture_origin_pt = (0.0, 0.0)
 
-        self._set_active_screen_by_mouse(fallback_to_main=True)
+        # Initialize geometry from main screen; we'll sync to the command bar on show/drag.
+        screen = AppKit.NSScreen.mainScreen()
+        self.screen_frame = screen.frame()
+        self.screen_height = self.screen_frame.size.height
+        self.screen_center = (
+            self.screen_frame.size.width / 2.0,
+            self.screen_frame.size.height / 2.0,
+        )
 
         self.command_bar = CommandBarWindow.alloc().initWithController_screenFrame_(
             self, self.screen_frame
@@ -748,9 +762,8 @@ class AppController(AppKit.NSObject):
         except Exception:
             return None
 
-    def _screen_index_for_mouse(self):
-        # NSEvent mouseLocation is in global screen coords (points).
-        pt = AppKit.NSEvent.mouseLocation()
+    def _screen_index_for_point(self, pt):
+        # `pt` is in global screen coords (points).
         screens = self._screens()
         for idx, s in enumerate(screens):
             f = s.frame()
@@ -763,15 +776,47 @@ class AppController(AppKit.NSObject):
                 return idx
         return None
 
-    def _set_active_screen_by_mouse(self, fallback_to_main=True):
-        idx = self._screen_index_for_mouse()
-        if idx is None and fallback_to_main:
-            idx = 0
+    def _screen_index_for_mouse(self):
+        return self._screen_index_for_point(AppKit.NSEvent.mouseLocation())
+
+    def _sync_active_screen_to_command_bar(self, announce=False):
+        """Make the active screen track the command bar's current screen."""
+        if not getattr(self, "_follow_command_bar", True):
+            return
+        if not hasattr(self, "command_bar"):
+            return
+        window = getattr(self.command_bar, "window", None)
+        if window is None:
+            return
+
+        # Best signal: AppKit knows which NSScreen the window is on.
+        screen = window.screen()
+        screens = self._screens()
+        if screen is None:
+            # Fallback: use window center point.
+            frame = window.frame()
+            center = Foundation.NSMakePoint(
+                frame.origin.x + frame.size.width / 2.0,
+                frame.origin.y + frame.size.height / 2.0,
+            )
+            idx = self._screen_index_for_point(center)
+        else:
+            try:
+                idx = screens.index(screen)
+            except ValueError:
+                idx = None
+
+        if idx is None:
+            # last resort
+            idx = self._screen_index_for_mouse()
+
         if idx is None:
             return
-        self._set_active_screen(idx, announce=False)
 
-    def _set_active_screen(self, index, announce=True):
+        if idx != getattr(self, "_active_screen_index", 0):
+            self._set_active_screen(idx, announce=announce, rebuild_command_bar=False)
+
+    def _set_active_screen(self, index, announce=True, rebuild_command_bar=True):
         screens = self._screens()
         if not screens:
             return
@@ -806,23 +851,28 @@ class AppController(AppKit.NSObject):
         if hasattr(self, "overlay"):
             self.overlay.clear()
 
-        # Rebuild windows so they are positioned/sized for the active screen.
+        # Rebuild/update windows so they are positioned/sized for the active screen.
         # During initial init, windows may not exist yet.
         if hasattr(self, "command_bar") and hasattr(self, "overlay"):
             was_visible = getattr(self.command_bar, "visible", False)
-            if was_visible:
-                self.command_bar.hide()
+
+            # Always rebuild overlay for the new screen frame.
             try:
                 self.overlay.window.orderOut_(None)
             except Exception:
                 pass
-
-            self.command_bar = CommandBarWindow.alloc().initWithController_screenFrame_(
-                self, self.screen_frame
-            )
             self.overlay = OverlayWindow.alloc().initWithScreenFrame_(self.screen_frame)
 
-            if announce:
+            # Optionally rebuild command bar (this recenters it). When we are following
+            # the user's dragged command bar, we do NOT want to reset its position.
+            if rebuild_command_bar:
+                if was_visible:
+                    self.command_bar.hide()
+                self.command_bar = CommandBarWindow.alloc().initWithController_screenFrame_(
+                    self, self.screen_frame
+                )
+
+            if announce and hasattr(self, "command_bar"):
                 self.command_bar.set_status(f"Active screen: {index + 1}/{len(screens)}")
             if was_visible:
                 self.command_bar.show()
@@ -905,6 +955,8 @@ class AppController(AppKit.NSObject):
             self.command_bar.hide()
         else:
             self.command_bar.show()
+            # Follow the command bar's current screen as the active screen.
+            self._sync_active_screen_to_command_bar(announce=False)
             self.command_bar.clear_input()
             self.command_bar.set_status("")
             self.command_bar.hide_help()
@@ -1293,6 +1345,7 @@ class AppController(AppKit.NSObject):
         arg = parts[1].strip() if len(parts) > 1 else ""
         if name == "capture":
             self._macro_wait_reason = "capture"
+            self._sync_active_screen_to_command_bar(announce=False)
             self._handle_capture()
         elif name == "find":
             self._macro_wait_reason = "find"
@@ -1408,10 +1461,12 @@ class AppController(AppKit.NSObject):
 
         if name == "capture":
             self._record_step("capture")
+            self._sync_active_screen_to_command_bar(announce=False)
             self._handle_capture()
         elif name == "find":
             if arg:
                 self._record_step(f"find {arg}")
+            self._sync_active_screen_to_command_bar(announce=False)
             self._handle_find(arg)
         elif name == "click":
             self._handle_click(arg, record=True, button="left")
@@ -1435,8 +1490,10 @@ class AppController(AppKit.NSObject):
         elif name == "delete":
             self._delete_macro(arg)
         elif name == "capture-image":
+            self._sync_active_screen_to_command_bar(announce=False)
             self._capture_image(arg)
         elif name == "find-image":
+            self._sync_active_screen_to_command_bar(announce=False)
             self._find_image(arg)
         elif name == "images":
             self._list_images()
@@ -1449,12 +1506,12 @@ class AppController(AppKit.NSObject):
         elif name == "help":
             self.command_bar.set_status("Commands")
             self.command_bar.show_help(
-                "capture  - capture active screen\n"
+                "capture  - capture active screen (follows command bar by default)\n"
                 "find <text>  - capture + find text\n"
                 "click <number>  - left click match\n"
                 "rclick <number>  - right click match\n"
                 "screens  - list displays\n"
-                "screen <n>|auto  - set active display\n"
+                "screen <n>|auto  - set active display (auto follows command bar)\n"
                 "clear  - close and reset\n"
                 "record <name>  - start recording\n"
                 "stop  - save recording\n"
@@ -1498,15 +1555,18 @@ class AppController(AppKit.NSObject):
     def _handle_screen_command(self, arg):
         val = (arg or "").strip().lower()
         if not val or val == "auto":
-            self._set_active_screen_by_mouse(fallback_to_main=True)
-            self.command_bar.set_status("Active screen: auto (mouse)")
+            self._follow_command_bar = True
+            self._sync_active_screen_to_command_bar(announce=True)
+            self.command_bar.set_status("Active screen: auto (command bar)")
             return
         try:
             idx = int(val) - 1
         except ValueError:
             self.command_bar.set_status("Usage: screen <n>|auto")
             return
-        self._set_active_screen(idx, announce=True)
+        # Manual override disables following the command bar.
+        self._follow_command_bar = False
+        self._set_active_screen(idx, announce=True, rebuild_command_bar=True)
 
     def _handle_capture(self):
         if self._ocr_in_progress:
@@ -1593,6 +1653,7 @@ class AppController(AppKit.NSObject):
         threading.Thread(target=task, daemon=True).start()
 
     def _handle_find(self, query):
+        self._sync_active_screen_to_command_bar(announce=False)
         if not query:
             self.command_bar.set_status("Missing search text")
             return

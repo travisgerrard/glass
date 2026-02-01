@@ -38,7 +38,7 @@ Spotlight-style command bar for capturing the primary display, searching OCR tex
 
 ## Notes
 
-- Supports selecting the active display (see `screens` / `screen <n>`).
+- Supports selecting the active display (default: whichever screen the command bar is on). Use `screens` / `screen <n>`.
 - Screen capture uses Quartz `CGWindowListCreateImage` (ScreenCaptureKit omitted for simplicity).
 - If the hotkey does not respond, enable Input Monitoring for your terminal or Python.
 - Match numbering uses closest-first ordering relative to the last click location (fallback: screen center).
