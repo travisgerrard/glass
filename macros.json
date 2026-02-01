@@ -19,7 +19,7 @@
       "find Summary",
       "click 1"
     ],
-    "sendmsg": [
+    "s": [
       "find To consumer",
       "click 1",
       "find Send",
@@ -37,13 +37,33 @@
       "find 99214",
       "click 1"
     ],
-    "mddfu": [
-      "find Document Plan",
-      "click 2",
-      "find plan summerized in",
-      "find Plan summarized in",
+    "99213": [
+      "find Chart",
       "click 1",
-      "find-image check"
+      "find Summary",
+      "click 1",
+      "find Charges",
+      "click 1",
+      "find 99213",
+      "click 1"
+    ],
+    "mddplan": [
+      "find-image mddplan_1",
+      "click 1",
+      "find-image mddplan_2",
+      "click 1",
+      "find-image mddplan_3",
+      "click 1",
+      "find-image mddplan_4",
+      "click 1",
+      "find-image mddplan_5",
+      "click 1"
+    ],
+    "diag": [
+      "find chart",
+      "click 1",
+      "find Diagnosis Problems",
+      "click 1"
     ]
   }
 }

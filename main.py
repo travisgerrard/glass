@@ -1028,6 +1028,37 @@ class AppController(AppKit.NSObject):
         with open(path, "w", encoding="utf-8") as handle:
             json.dump({"macros": self.macros}, handle, indent=2)
 
+    def _get_macro_steps(self, name):
+        """Get steps from a macro, handling both v1 (array) and v2 (object) formats."""
+        macro = self.macros.get(name)
+        if macro is None:
+            return []
+        if isinstance(macro, list):
+            # v1 format: macro is just an array of steps
+            return macro
+        if isinstance(macro, dict):
+            # v2 format: macro is {"v": 2, "resolution": [...], "steps": [...]}
+            return macro.get("steps", [])
+        return []
+
+    def _get_macro_resolution(self, name):
+        """Get resolution from a v2 macro, or None for v1 macros."""
+        macro = self.macros.get(name)
+        if isinstance(macro, dict):
+            res = macro.get("resolution")
+            if isinstance(res, list) and len(res) == 2:
+                return tuple(res)
+        return None
+
+    def _get_macro_version(self, name):
+        """Get macro version (1 for array format, 2+ for object format)."""
+        macro = self.macros.get(name)
+        if isinstance(macro, list):
+            return 1
+        if isinstance(macro, dict):
+            return macro.get("v", 2)
+        return 1
+
     def _record_step(self, step):
         if not step:
             return
@@ -1050,18 +1081,38 @@ class AppController(AppKit.NSObject):
             return
         self._recording_name = name
         self._recording_steps = []
-        self.command_bar.set_status(f"Recording {name}")
+        # Capture resolution for v2 format
+        self._recording_resolution = (
+            int(self.screen_frame.size.width),
+            int(self.screen_frame.size.height),
+        )
+        # Track time for wait insertion
+        self._recording_last_action_time = time.time()
+        res_str = f"{self._recording_resolution[0]}x{self._recording_resolution[1]}"
+        self.command_bar.set_status(f"Recording {name} ({res_str})")
 
     def _stop_recording(self):
         if self._recording_name is None:
             self.command_bar.set_status("Not recording")
             return
         name = self._recording_name
-        self.macros[name] = list(self._recording_steps)
+        # Save in v2 format with resolution metadata
+        resolution = getattr(self, "_recording_resolution", None)
+        if resolution:
+            self.macros[name] = {
+                "v": 2,
+                "resolution": list(resolution),
+                "steps": list(self._recording_steps),
+            }
+        else:
+            # Fallback to v1 if no resolution captured
+            self.macros[name] = list(self._recording_steps)
         self._save_macros()
         count = len(self._recording_steps)
         self._recording_name = None
         self._recording_steps = []
+        self._recording_resolution = None
+        self._recording_last_action_time = None
         self.command_bar.set_status(f"Saved macro {name} ({count} steps)")
 
     def _list_macros(self):
@@ -1081,8 +1132,13 @@ class AppController(AppKit.NSObject):
         if name not in self.macros:
             self.command_bar.set_status("Macro not found")
             return
-        steps = self.macros.get(name) or []
-        self.command_bar.set_status(f"Macro {name}")
+        steps = self._get_macro_steps(name)
+        resolution = self._get_macro_resolution(name)
+        version = self._get_macro_version(name)
+        status = f"Macro {name}"
+        if resolution:
+            status += f" (v{version}, {resolution[0]}x{resolution[1]})"
+        self.command_bar.set_status(status)
         if steps:
             self.command_bar.show_help("\n".join(steps))
         else:
@@ -1223,7 +1279,7 @@ class AppController(AppKit.NSObject):
             y_pt = pt[1] / scale
             w_pt = template_w / scale
             h_pt = template_h / scale
-            matches.append({"text": name, "bbox": (x_pt, y_pt, w_pt, h_pt)})
+            matches.append({"text": name, "bbox": (x_pt, y_pt, w_pt, h_pt), "query": name, "type": "image"})
         # Deduplicate overlapping matches
         filtered = []
         for m in matches:
@@ -1284,10 +1340,21 @@ class AppController(AppKit.NSObject):
         if name not in self.macros:
             self.command_bar.set_status("Macro not found")
             return
-        steps = self.macros.get(name) or []
+        steps = self._get_macro_steps(name)
         if not steps:
             self.command_bar.set_status(f"Macro empty: {name}")
             return
+        # Check resolution for v2 macros
+        recorded_res = self._get_macro_resolution(name)
+        if recorded_res:
+            current_res = (
+                int(self.screen_frame.size.width),
+                int(self.screen_frame.size.height),
+            )
+            if recorded_res != current_res:
+                self.command_bar.set_status(
+                    f"Resolution: {recorded_res[0]}x{recorded_res[1]} → {current_res[0]}x{current_res[1]}"
+                )
         expanded = self._expand_macro(name)
         if expanded is None:
             return
@@ -1304,7 +1371,7 @@ class AppController(AppKit.NSObject):
         if name not in self.macros:
             self.command_bar.set_status("Macro not found")
             return None
-        steps = self.macros.get(name) or []
+        steps = self._get_macro_steps(name)
         if name in self._macro_stack:
             self._abort_macro("Macro recursion detected")
             return None
@@ -1394,6 +1461,14 @@ class AppController(AppKit.NSObject):
         elif name == "find-image":
             self._macro_wait_reason = "find-image"
             self._find_image(arg)
+        elif name == "wait":
+            self._execute_wait(arg)
+        elif name == "smart-click":
+            self._macro_wait_reason = "smart-click"
+            self._execute_smart_click(arg, button="left")
+        elif name == "smart-rclick":
+            self._macro_wait_reason = "smart-click"
+            self._execute_smart_click(arg, button="right")
         else:
             self._abort_macro(f"Unknown step: {step}")
 
@@ -1413,6 +1488,146 @@ class AppController(AppKit.NSObject):
             self._macro_stack = []
         if message:
             self.command_bar.set_status(message)
+
+    def _execute_wait(self, arg):
+        """Execute a wait command during macro playback."""
+        try:
+            seconds = float(arg)
+        except (ValueError, TypeError):
+            seconds = 1.0
+        seconds = max(0.0, min(30.0, seconds))  # Clamp to 0-30s
+        if seconds > 0:
+            self.command_bar.set_status(f"Waiting {seconds:.1f}s...")
+            time.sleep(seconds)
+
+    def _execute_smart_click(self, arg, button="left"):
+        """Execute a smart-click command during macro playback.
+
+        Format: smart-click "query" xPct yPct [--allow-fallback]
+        """
+        # Parse the command
+        allow_fallback = "--allow-fallback" in arg
+        arg_clean = arg.replace("--allow-fallback", "").strip()
+
+        # Extract quoted query and coordinates
+        query, x_pct, y_pct = self._parse_smart_click_args(arg_clean)
+        if not query:
+            self._abort_macro(f"Invalid smart-click: {arg}")
+            return
+
+        self.command_bar.set_status(f"Finding '{query}'...")
+
+        # Run capture + OCR + find (async)
+        self._smart_click_query = query
+        self._smart_click_x_pct = x_pct
+        self._smart_click_y_pct = y_pct
+        self._smart_click_button = button
+        self._smart_click_allow_fallback = allow_fallback
+
+        # Trigger find, which will call _smart_click_after_find when done
+        self._pending_find_query = query
+        self._handle_capture()
+
+    def _parse_smart_click_args(self, arg):
+        """Parse smart-click arguments: "query" xPct yPct"""
+        query = None
+        x_pct = None
+        y_pct = None
+
+        # Handle quoted query
+        if arg.startswith('"'):
+            # Find closing quote (handle escaped quotes)
+            i = 1
+            while i < len(arg):
+                if arg[i] == '"' and arg[i-1] != '\\':
+                    break
+                i += 1
+            if i < len(arg):
+                query = arg[1:i].replace('\\"', '"').replace('\\\\', '\\')
+                rest = arg[i+1:].strip()
+                parts = rest.split()
+                if len(parts) >= 2:
+                    try:
+                        x_pct = float(parts[0])
+                        y_pct = float(parts[1])
+                    except ValueError:
+                        pass
+                elif len(parts) == 0:
+                    # No coordinates - just query
+                    x_pct = None
+                    y_pct = None
+        else:
+            # Unquoted - split by space
+            parts = arg.split()
+            if parts:
+                query = parts[0]
+                if len(parts) >= 3:
+                    try:
+                        x_pct = float(parts[1])
+                        y_pct = float(parts[2])
+                    except ValueError:
+                        pass
+
+        return query, x_pct, y_pct
+
+    def _smart_click_after_find(self):
+        """Called after OCR completes to finish smart-click execution."""
+        query = getattr(self, "_smart_click_query", None)
+        x_pct = getattr(self, "_smart_click_x_pct", None)
+        y_pct = getattr(self, "_smart_click_y_pct", None)
+        button = getattr(self, "_smart_click_button", "left")
+        allow_fallback = getattr(self, "_smart_click_allow_fallback", False)
+
+        # Clear state
+        self._smart_click_query = None
+        self._smart_click_x_pct = None
+        self._smart_click_y_pct = None
+        self._smart_click_button = None
+        self._smart_click_allow_fallback = None
+
+        if not self.matches:
+            # No matches found
+            if allow_fallback and x_pct is not None and y_pct is not None:
+                # Fallback to coordinate click
+                self.command_bar.set_status(f"'{query}' not found, using coordinates")
+                target_x = x_pct * self.screen_frame.size.width
+                target_y = y_pct * self.screen_frame.size.height
+                self._click_at(target_x, target_y, button=button)
+                self.last_click_point = (target_x, target_y)
+                self._macro_step_complete()
+            else:
+                # Safe fallback: stop macro
+                self._abort_macro(f"Text '{query}' not found - macro stopped")
+            return
+
+        if len(self.matches) == 1 or x_pct is None or y_pct is None:
+            # Single match or no coordinates - click first match
+            match = self.matches[0]
+        else:
+            # Multiple matches - find closest to stored coordinates
+            target_x = x_pct * self.screen_frame.size.width
+            target_y = y_pct * self.screen_frame.size.height
+
+            def distance_to_target(m):
+                x, y, w, h = m["bbox"]
+                cx = x + (w / 2.0)
+                cy = y + (h / 2.0)
+                return (cx - target_x) ** 2 + (cy - target_y) ** 2
+
+            match = min(self.matches, key=distance_to_target)
+
+        # Click the match
+        bbox = match["bbox"]
+        x, y, w, h = bbox
+        cx = x + (w / 2.0)
+        cy = y + (h / 2.0)
+
+        self._click_at(cx, cy, button=button)
+        self.last_click_point = (cx, cy)
+        self.overlay.clear()
+        self.matches = []
+
+        self._macro_step_complete()
 
     def _anchor_point(self):
         if self.last_click_point is not None:
@@ -1492,7 +1707,8 @@ class AppController(AppKit.NSObject):
             self._sync_active_screen_to_command_bar(announce=False)
             self._handle_capture()
         elif name == "find":
-            if arg:
+            # In v2 recording, don't record "find" - smart-click will capture it
+            if arg and self._recording_name is None:
                 self._record_step(f"find {arg}")
             self._sync_active_screen_to_command_bar(announce=False)
             self._handle_find(arg)
@@ -1559,7 +1775,9 @@ class AppController(AppKit.NSObject):
                 self._record_step(f"run {macro_name}")
                 self._run_macro(macro_name)
             else:
-                self._record_step(f"find {command}")
+                # In v2 recording, don't record "find" - smart-click will capture it
+                if self._recording_name is None:
+                    self._record_step(f"find {command}")
                 self._handle_find(command)
 
     def _list_screens(self):
@@ -1713,7 +1931,7 @@ class AppController(AppKit.NSObject):
                 bbox = self._bbox_for_text_range(item, found)
                 if bbox is None:
                     bbox = item["bbox"]
-                matches.append({"text": text, "bbox": bbox})
+                matches.append({"text": text, "bbox": bbox, "query": query})
                 next_location = found.location + max(found.length, 1)
                 if next_location >= ns_full.length():
                     break
@@ -1726,6 +1944,8 @@ class AppController(AppKit.NSObject):
         self.command_bar.set_status(f"Found {len(matches)} matches")
         if self._macro_wait_reason == "find":
             self._macro_step_complete()
+        elif self._macro_wait_reason == "smart-click":
+            self._smart_click_after_find()
 
     def _bbox_for_text_range(self, item, text_range):
         vn_text = item.get("vn_text")
@@ -1768,18 +1988,56 @@ class AppController(AppKit.NSObject):
             self.command_bar.set_status("Invalid selection")
             return
 
-        if record:
-            name = "click" if button == "left" else "rclick"
-            self._record_step(f"{name} {index}")
-        bbox = self.matches[index - 1]["bbox"]
+        match = self.matches[index - 1]
+        bbox = match["bbox"]
         x, y, w, h = bbox
         cx = x + (w / 2.0)
         cy = y + (h / 2.0)
+
+        if record and self._recording_name is not None:
+            # Smart-click recording: capture query + normalized coordinates
+            self._record_smart_click(match, cx, cy, button)
+        elif record:
+            # Not in recording mode, use legacy format (for non-recording clicks)
+            name = "click" if button == "left" else "rclick"
+            self._record_step(f"{name} {index}")
+
         self._click_at(cx, cy, button=button)
         self.last_click_point = (cx, cy)
         self.overlay.clear()
         self.matches = []
         self.command_bar.hide()
+
+    def _record_smart_click(self, match, cx, cy, button="left"):
+        """Record a smart-click step with query text and normalized coordinates."""
+        # Insert wait step if needed
+        last_time = getattr(self, "_recording_last_action_time", None)
+        if last_time is not None:
+            elapsed = time.time() - last_time
+            if elapsed > 0.5:
+                # Round to 0.5s increments, cap at 10s
+                wait_time = min(10.0, round(elapsed * 2) / 2)
+                self._recording_steps.append(f"wait {wait_time:.1f}")
+
+        # Get query text from match (fallback to full text)
+        query = match.get("query", match.get("text", ""))
+
+        # Calculate normalized coordinates (percentage of screen)
+        screen_w = self.screen_frame.size.width
+        screen_h = self.screen_frame.size.height
+        x_pct = cx / screen_w if screen_w > 0 else 0
+        y_pct = cy / screen_h if screen_h > 0 else 0
+
+        # Escape quotes in query for storage
+        escaped_query = query.replace("\\", "\\\\").replace('"', '\\"')
+
+        # Determine command prefix based on button
+        cmd = "smart-click" if button == "left" else "smart-rclick"
+        step = f'{cmd} "{escaped_query}" {x_pct:.4f} {y_pct:.4f}'
+        self._recording_steps.append(step)
+
+        # Update last action time
+        self._recording_last_action_time = time.time()
 
     def _click_at(self, x, y, button="left"):
         # `x,y` are in points relative to the *active screen*.
