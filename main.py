@@ -749,7 +749,32 @@ class AppController(AppKit.NSObject):
         self._history_index = -1
         self._load_macros()
         self._setup_hotkey()
+        self._status_flash_token = 0
         return self
+
+    def _flash_status(self, message, duration=1.25):
+        """Show a temporary status message, then clear it."""
+        if not hasattr(self, "command_bar"):
+            return
+        self._status_flash_token += 1
+        token = self._status_flash_token
+        self.command_bar.set_status(message)
+
+        def clear_later():
+            def do_clear():
+                # Only clear if nothing newer replaced it.
+                if token != getattr(self, "_status_flash_token", 0):
+                    return
+                # Don't clobber user typing.
+                if not getattr(self.command_bar, "visible", False):
+                    return
+                if self.command_bar.input_text():
+                    return
+                self.command_bar.set_status("")
+
+            run_on_main(do_clear)
+
+        threading.Timer(duration, clear_later).start()
 
     def _screens(self):
         # NSScreen frames are in points in a global coordinate space.
@@ -815,6 +840,9 @@ class AppController(AppKit.NSObject):
 
         if idx != getattr(self, "_active_screen_index", 0):
             self._set_active_screen(idx, announce=announce, rebuild_command_bar=False)
+        elif announce and hasattr(self, "command_bar"):
+            # Still give feedback when requested, even if unchanged.
+            self._flash_status(f"Active screen: {idx + 1}/{len(self._screens())}")
 
     def _set_active_screen(self, index, announce=True, rebuild_command_bar=True):
         screens = self._screens()
@@ -873,7 +901,7 @@ class AppController(AppKit.NSObject):
                 )
 
             if announce and hasattr(self, "command_bar"):
-                self.command_bar.set_status(f"Active screen: {index + 1}/{len(screens)}")
+                self._flash_status(f"Active screen: {index + 1}/{len(screens)}")
             if was_visible:
                 self.command_bar.show()
                 self.command_bar.clear_input()
