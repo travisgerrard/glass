@@ -1490,7 +1490,7 @@ class AppController(AppKit.NSObject):
             self.command_bar.set_status(message)
 
     def _execute_wait(self, arg):
-        """Execute a wait command during macro playback."""
+        """Execute a wait command during macro playback (non-blocking)."""
         try:
             seconds = float(arg)
         except (ValueError, TypeError):
@@ -1498,7 +1498,22 @@ class AppController(AppKit.NSObject):
         seconds = max(0.0, min(30.0, seconds))  # Clamp to 0-30s
         if seconds > 0:
             self.command_bar.set_status(f"Waiting {seconds:.1f}s...")
-            time.sleep(seconds)
+            self._macro_wait_reason = "wait"
+
+            def schedule_wait_timer():
+                AppKit.NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+                    seconds, self, "waitTimerFired:", None, False
+                )
+
+            run_on_main(schedule_wait_timer)
+        else:
+            # No wait needed, continue immediately
+            pass
+
+    def waitTimerFired_(self, timer):
+        """Called when wait timer completes."""
+        if self._macro_wait_reason == "wait":
+            self._macro_step_complete()
 
     def _execute_smart_click(self, arg, button="left"):
         """Execute a smart-click command during macro playback.
