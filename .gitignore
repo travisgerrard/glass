@@ -18,5 +18,5 @@ __pycache__/
 *.swp
 *.swo
 
-# Images captured for macros (optional - uncomment if you want to track them)
-# images/
+# Images captured for macros (may contain sensitive screen data)
+images/

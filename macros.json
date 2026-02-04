@@ -19,14 +19,6 @@
       "find Summary",
       "click 1"
     ],
-    "s": [
-      "find To consumer",
-      "click 1",
-      "find Send",
-      "click 1",
-      "find Yes",
-      "click 1"
-    ],
     "99214": [
       "find Chart",
       "click 1",
@@ -64,6 +56,59 @@
       "click 1",
       "find Diagnosis Problems",
       "click 1"
-    ]
+    ],
+    "podf": {
+      "v": 2,
+      "resolution": [
+        1512,
+        982
+      ],
+      "steps": [
+        "click-at 0.2862 0.2264",
+        "wait 2.5",
+        "smart-click \"DT GIM Pod Blue (F)\" 0.3292 0.4175",
+        "dclick-at 0.3292 0.4175",
+        "wait 1.0",
+        "smart-click \"Send\" 0.7224 0.9292",
+        "find No",
+        "click 1"
+      ]
+    },
+    "ss": {
+      "v": 2,
+      "resolution": [
+        1512,
+        982
+      ],
+      "steps": [
+        "smart-click \"Sign/Submit\" 0.7883 0.9360",
+        "wait 1.0",
+        "smart-click \"Sign\" 0.7712 0.8973"
+      ]
+    },
+    "s": {
+      "v": 2,
+      "resolution": [
+        1512,
+        982
+      ],
+      "steps": [
+        "smart-click \"To consumer\" 0.6606 0.2540",
+        "wait 1.0",
+        "smart-click \"Send\" 0.7211 0.9192",
+        "wait 1.5",
+        "smart-click \"Yes\" 0.5531 0.5955"
+      ]
+    },
+    "d": {
+      "v": 2,
+      "resolution": [
+        1512,
+        982
+      ],
+      "steps": [
+        "smart-click \"Delete\" 0.3089 0.2488"
+      ]
+    }
   }
 }

@@ -736,6 +736,7 @@ class AppController(AppKit.NSObject):
         self.macros = {}
         self._recording_name = None
         self._recording_steps = []
+        self._recording_mouse_monitor = None
         self._macro_running = False
         self._macro_queue = []
         self._macro_name = None
@@ -1070,6 +1071,7 @@ class AppController(AppKit.NSObject):
 
     def _start_recording(self, name):
         name = self._normalize_macro_name(name)
+        print(f"DEBUG _start_recording: name={name!r}")
         if not name:
             self.command_bar.set_status("Missing macro name")
             return
@@ -1081,6 +1083,7 @@ class AppController(AppKit.NSObject):
             return
         self._recording_name = name
         self._recording_steps = []
+        print(f"DEBUG _start_recording: recording started, _recording_name={self._recording_name}")
         # Capture resolution for v2 format
         self._recording_resolution = (
             int(self.screen_frame.size.width),
@@ -1088,10 +1091,15 @@ class AppController(AppKit.NSObject):
         )
         # Track time for wait insertion
         self._recording_last_action_time = time.time()
+        # Start global mouse click monitoring
+        self._start_recording_mouse_monitor()
         res_str = f"{self._recording_resolution[0]}x{self._recording_resolution[1]}"
-        self.command_bar.set_status(f"Recording {name} ({res_str})")
+        self.command_bar.set_status(f"Recording {name} ({res_str}) - click anywhere")
 
     def _stop_recording(self):
+        print(f"DEBUG _stop_recording: _recording_name={self._recording_name}, steps={self._recording_steps}")
+        # Stop mouse monitoring first
+        self._stop_recording_mouse_monitor()
         if self._recording_name is None:
             self.command_bar.set_status("Not recording")
             return
@@ -1114,6 +1122,158 @@ class AppController(AppKit.NSObject):
         self._recording_resolution = None
         self._recording_last_action_time = None
         self.command_bar.set_status(f"Saved macro {name} ({count} steps)")
+
+    def _start_recording_mouse_monitor(self):
+        """Start global mouse click monitoring for recording."""
+        if self._recording_mouse_monitor is not None:
+            return
+        mask = AppKit.NSEventMaskLeftMouseDown | AppKit.NSEventMaskRightMouseDown
+        self._recording_mouse_monitor = AppKit.NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(
+            mask, self._handle_recording_mouse_click
+        )
+        print("DEBUG: Started recording mouse monitor")
+
+    def _stop_recording_mouse_monitor(self):
+        """Stop global mouse click monitoring."""
+        if self._recording_mouse_monitor is not None:
+            AppKit.NSEvent.removeMonitor_(self._recording_mouse_monitor)
+            self._recording_mouse_monitor = None
+            print("DEBUG: Stopped recording mouse monitor")
+
+    def _handle_recording_mouse_click(self, event):
+        """Handle a global mouse click during recording."""
+        if self._recording_name is None:
+            return
+
+        # Debounce - ignore clicks within 100ms of last recorded click
+        now = time.time()
+        last_click = getattr(self, "_recording_last_click_time", 0)
+        if now - last_click < 0.1:
+            print("DEBUG: Ignoring click (debounce)")
+            return
+        self._recording_last_click_time = now
+
+        # Get click location - for global monitor, locationInWindow() gives screen coords
+        # in Cocoa coordinate system (origin at bottom-left)
+        mouse_loc = AppKit.NSEvent.mouseLocation()
+
+        # Ignore clicks on the command bar window
+        if hasattr(self, "command_bar") and self.command_bar.window:
+            cmd_frame = self.command_bar.window.frame()
+            if AppKit.NSPointInRect(mouse_loc, cmd_frame):
+                print("DEBUG: Ignoring click on command bar")
+                return
+
+        # Find which screen the click is on
+        click_screen = None
+        for screen in AppKit.NSScreen.screens():
+            frame = screen.frame()
+            if AppKit.NSPointInRect(mouse_loc, frame):
+                click_screen = screen
+                break
+
+        if click_screen is None:
+            click_screen = AppKit.NSScreen.mainScreen()
+
+        # Convert to screen-relative coordinates with origin at top-left
+        screen_frame = click_screen.frame()
+        click_x = mouse_loc.x - screen_frame.origin.x
+        click_y = screen_frame.size.height - (mouse_loc.y - screen_frame.origin.y)
+
+        button = "left" if event.type() == AppKit.NSEventTypeLeftMouseDown else "right"
+        click_count = event.clickCount()
+        print(f"DEBUG _handle_recording_mouse_click: click at ({click_x}, {click_y}), button={button}, clickCount={click_count}")
+
+        # Run OCR and record the click in the background
+        def do_record():
+            self._record_click_with_ocr(click_x, click_y, button, click_count)
+
+        # Use a thread to avoid blocking
+        threading.Thread(target=do_record, daemon=True).start()
+
+    def _record_click_with_ocr(self, click_x, click_y, button="left", click_count=1):
+        """Capture screen, run OCR, and record a click at the given position."""
+        try:
+            # Capture screen
+            display_id = self._active_display_id
+            screen_size = (self.screen_frame.size.width, self.screen_frame.size.height)
+            cg_image, width_px, height_px, scale, bounds_px = self.ocr_engine.capture_display(
+                display_id, screen_size
+            )
+
+            # Run OCR
+            ocr_items = self.ocr_engine.recognize_text(cg_image, width_px, height_px, scale)
+
+            # Find text under the click (with some tolerance)
+            tolerance = 10  # pixels tolerance for "under" detection
+            text_under_click = None
+
+            for item in ocr_items:
+                bbox = item["bbox"]  # (x, y, w, h) in points
+                bx, by, bw, bh = bbox
+                # Check if click is within or near this text's bounding box
+                if (bx - tolerance <= click_x <= bx + bw + tolerance and
+                    by - tolerance <= click_y <= by + bh + tolerance):
+                    text_under_click = item
+                    break
+
+            # Insert wait step if needed
+            last_time = getattr(self, "_recording_last_action_time", None)
+            if last_time is not None:
+                elapsed = time.time() - last_time
+                if elapsed > 0.5:
+                    wait_time = min(10.0, round(elapsed * 2) / 2)
+                    self._recording_steps.append(f"wait {wait_time:.1f}")
+
+            screen_w = self.screen_frame.size.width
+            screen_h = self.screen_frame.size.height
+            x_pct = click_x / screen_w if screen_w > 0 else 0
+            y_pct = click_y / screen_h if screen_h > 0 else 0
+
+            # Determine click type based on button and click count
+            is_double = click_count >= 2
+            if text_under_click:
+                # Record smart-click with text anchor
+                query = text_under_click["text"]
+                escaped_query = query.replace("\\", "\\\\").replace('"', '\\"')
+                if is_double:
+                    cmd = "smart-dclick"
+                elif button == "left":
+                    cmd = "smart-click"
+                else:
+                    cmd = "smart-rclick"
+                step = f'{cmd} "{escaped_query}" {x_pct:.4f} {y_pct:.4f}'
+                click_type = "double-click" if is_double else "click"
+                print(f"DEBUG: Recorded smart-{click_type} with text: {query}")
+            else:
+                # No text under click - record absolute coordinates
+                if is_double:
+                    cmd = "dclick-at"
+                elif button == "left":
+                    cmd = "click-at"
+                else:
+                    cmd = "rclick-at"
+                step = f'{cmd} {x_pct:.4f} {y_pct:.4f}'
+                click_type = "double-click" if is_double else "click"
+                print(f"DEBUG: Recorded absolute {click_type} at ({x_pct:.4f}, {y_pct:.4f})")
+
+            self._recording_steps.append(step)
+            self._recording_last_action_time = time.time()
+
+            # Update status on main thread
+            click_desc = "double-click" if is_double else f"{button} click"
+            def update_status():
+                if text_under_click:
+                    self.command_bar.set_status(f"Recorded: {click_desc} on \"{text_under_click['text'][:20]}\"")
+                else:
+                    self.command_bar.set_status(f"Recorded: {click_desc} at ({x_pct:.2%}, {y_pct:.2%})")
+            run_on_main(update_status)
+
+        except Exception as e:
+            print(f"DEBUG: Error recording click: {e}")
+            def show_error():
+                self.command_bar.set_status(f"Error recording click: {e}")
+            run_on_main(show_error)
 
     def _list_macros(self):
         if not self.macros:
@@ -1469,6 +1629,15 @@ class AppController(AppKit.NSObject):
         elif name == "smart-rclick":
             self._macro_wait_reason = "smart-click"
             self._execute_smart_click(arg, button="right")
+        elif name == "click-at":
+            self._execute_click_at(arg, button="left")
+        elif name == "rclick-at":
+            self._execute_click_at(arg, button="right")
+        elif name == "smart-dclick":
+            self._macro_wait_reason = "smart-click"
+            self._execute_smart_click(arg, button="left", click_count=2)
+        elif name == "dclick-at":
+            self._execute_click_at(arg, button="left", click_count=2)
         else:
             self._abort_macro(f"Unknown step: {step}")
 
@@ -1515,7 +1684,7 @@ class AppController(AppKit.NSObject):
         if self._macro_wait_reason == "wait":
             self._macro_step_complete()
 
-    def _execute_smart_click(self, arg, button="left"):
+    def _execute_smart_click(self, arg, button="left", click_count=1):
         """Execute a smart-click command during macro playback.
 
         Format: smart-click "query" xPct yPct [--allow-fallback]
@@ -1538,6 +1707,7 @@ class AppController(AppKit.NSObject):
         self._smart_click_y_pct = y_pct
         self._smart_click_button = button
         self._smart_click_allow_fallback = allow_fallback
+        self._smart_click_count = click_count
 
         # Trigger find, which will call _smart_click_after_find when done
         self._pending_find_query = query
@@ -1585,6 +1755,35 @@ class AppController(AppKit.NSObject):
 
         return query, x_pct, y_pct
 
+    def _execute_click_at(self, arg, button="left", click_count=1):
+        """Execute a click-at command during macro playback.
+
+        Format: click-at xPct yPct
+        Clicks at absolute screen coordinates (normalized 0-1).
+        """
+        parts = arg.strip().split()
+        if len(parts) < 2:
+            self._abort_macro(f"Invalid click-at: {arg}")
+            return
+
+        try:
+            x_pct = float(parts[0])
+            y_pct = float(parts[1])
+        except ValueError:
+            self._abort_macro(f"Invalid click-at coordinates: {arg}")
+            return
+
+        # Convert to screen coordinates
+        screen_w = self.screen_frame.size.width
+        screen_h = self.screen_frame.size.height
+        click_x = x_pct * screen_w
+        click_y = y_pct * screen_h
+
+        click_type = "double-clicking" if click_count >= 2 else "clicking"
+        print(f"DEBUG _execute_click_at: {click_type} at ({click_x:.1f}, {click_y:.1f})")
+        self._click_at(click_x, click_y, button, click_count)
+        self._macro_step_complete()
+
     def _smart_click_after_find(self):
         """Called after OCR completes to finish smart-click execution."""
         query = getattr(self, "_smart_click_query", None)
@@ -1592,6 +1791,7 @@ class AppController(AppKit.NSObject):
         y_pct = getattr(self, "_smart_click_y_pct", None)
         button = getattr(self, "_smart_click_button", "left")
         allow_fallback = getattr(self, "_smart_click_allow_fallback", False)
+        click_count = getattr(self, "_smart_click_count", 1)
 
         # Clear state
         self._smart_click_query = None
@@ -1599,6 +1799,7 @@ class AppController(AppKit.NSObject):
         self._smart_click_y_pct = None
         self._smart_click_button = None
         self._smart_click_allow_fallback = None
+        self._smart_click_count = None
 
         if not self.matches:
             # No matches found
@@ -1607,7 +1808,7 @@ class AppController(AppKit.NSObject):
                 self.command_bar.set_status(f"'{query}' not found, using coordinates")
                 target_x = x_pct * self.screen_frame.size.width
                 target_y = y_pct * self.screen_frame.size.height
-                self._click_at(target_x, target_y, button=button)
+                self._click_at(target_x, target_y, button=button, click_count=click_count)
                 self.last_click_point = (target_x, target_y)
                 self._macro_step_complete()
             else:
@@ -1637,7 +1838,7 @@ class AppController(AppKit.NSObject):
         cx = x + (w / 2.0)
         cy = y + (h / 2.0)
 
-        self._click_at(cx, cy, button=button)
+        self._click_at(cx, cy, button=button, click_count=click_count)
         self.last_click_point = (cx, cy)
         self.overlay.clear()
         self.matches = []
@@ -1669,6 +1870,8 @@ class AppController(AppKit.NSObject):
             return
 
         def handler(event):
+            chars = event.characters()
+            print(f"DEBUG key_handler: char={chars!r}, visible={self.command_bar.visible}, matches={len(self.matches)}, input_text={self.command_bar.input_text()!r}")
             if not self.command_bar.visible:
                 return event
             if not self.matches:
@@ -1678,12 +1881,12 @@ class AppController(AppKit.NSObject):
             flags = event.modifierFlags() & AppKit.NSEventModifierFlagDeviceIndependentFlagsMask
             if flags != 0:
                 return event
-            chars = event.characters()
             if not chars or len(chars) != 1:
                 return event
             index, button = self._index_and_button_for_char(chars)
             if index is None:
                 return event
+            print(f"DEBUG key_handler: triggering click index={index}")
             self._handle_click(index, record=True, button=button)
             return None
 
@@ -2009,8 +2212,10 @@ class AppController(AppKit.NSObject):
         cx = x + (w / 2.0)
         cy = y + (h / 2.0)
 
+        print(f"DEBUG _handle_click: record={record}, _recording_name={self._recording_name}")
         if record and self._recording_name is not None:
             # Smart-click recording: capture query + normalized coordinates
+            print(f"DEBUG: calling _record_smart_click")
             self._record_smart_click(match, cx, cy, button)
         elif record:
             # Not in recording mode, use legacy format (for non-recording clicks)
@@ -2025,6 +2230,7 @@ class AppController(AppKit.NSObject):
 
     def _record_smart_click(self, match, cx, cy, button="left"):
         """Record a smart-click step with query text and normalized coordinates."""
+        print(f"DEBUG _record_smart_click: match={match.get('query', match.get('text', ''))}")
         # Insert wait step if needed
         last_time = getattr(self, "_recording_last_action_time", None)
         if last_time is not None:
@@ -2054,27 +2260,30 @@ class AppController(AppKit.NSObject):
         # Update last action time
         self._recording_last_action_time = time.time()
 
-    def _click_at(self, x, y, button="left"):
+    def _click_at(self, x, y, button="left", click_count=1):
         # `x,y` are in points relative to the *active screen*.
         # Quartz mouse events expect global display coordinates.
         ox, oy = getattr(self, "capture_origin_pt", (0.0, 0.0))
         point = Quartz.CGPointMake(ox + x, oy + y)
+
         if button == "right":
-            event_down = Quartz.CGEventCreateMouseEvent(
-                None, Quartz.kCGEventRightMouseDown, point, Quartz.kCGMouseButtonRight
-            )
-            event_up = Quartz.CGEventCreateMouseEvent(
-                None, Quartz.kCGEventRightMouseUp, point, Quartz.kCGMouseButtonRight
-            )
+            down_type = Quartz.kCGEventRightMouseDown
+            up_type = Quartz.kCGEventRightMouseUp
+            mouse_button = Quartz.kCGMouseButtonRight
         else:
-            event_down = Quartz.CGEventCreateMouseEvent(
-                None, Quartz.kCGEventLeftMouseDown, point, Quartz.kCGMouseButtonLeft
-            )
-            event_up = Quartz.CGEventCreateMouseEvent(
-                None, Quartz.kCGEventLeftMouseUp, point, Quartz.kCGMouseButtonLeft
-            )
-        Quartz.CGEventPost(Quartz.kCGHIDEventTap, event_down)
-        Quartz.CGEventPost(Quartz.kCGHIDEventTap, event_up)
+            down_type = Quartz.kCGEventLeftMouseDown
+            up_type = Quartz.kCGEventLeftMouseUp
+            mouse_button = Quartz.kCGMouseButtonLeft
+
+        # For double-click, we need to send two click pairs with incrementing click count
+        for i in range(1, click_count + 1):
+            event_down = Quartz.CGEventCreateMouseEvent(None, down_type, point, mouse_button)
+            event_up = Quartz.CGEventCreateMouseEvent(None, up_type, point, mouse_button)
+            # Set the click state (1 for single, 2 for double, etc.)
+            Quartz.CGEventSetIntegerValueField(event_down, Quartz.kCGMouseEventClickState, i)
+            Quartz.CGEventSetIntegerValueField(event_up, Quartz.kCGMouseEventClickState, i)
+            Quartz.CGEventPost(Quartz.kCGHIDEventTap, event_down)
+            Quartz.CGEventPost(Quartz.kCGHIDEventTap, event_up)
 
 
 class AppDelegate(AppKit.NSObject):
