@@ -97,7 +97,9 @@
         "wait 1.0",
         "smart-click \"Send\" 0.7211 0.9192",
         "wait 1.5",
-        "smart-click \"Yes\" 0.5531 0.5955"
+        "smart-click \"Yes\" 0.5531 0.5955",
+        "wait 1",
+        "run del"
       ]
     },
     "d": {
@@ -108,6 +110,16 @@
       ],
       "steps": [
         "smart-click \"Delete\" 0.3089 0.2488"
+      ]
+    },
+    "del": {
+      "v": 2,
+      "resolution": [
+        1512,
+        982
+      ],
+      "steps": [
+        "smart-click \"Delete\" 0.3109 0.2483"
       ]
     }
   }
