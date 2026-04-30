@@ -1,5 +1,7 @@
 import json
 import os
+import re
+import subprocess
 import threading
 import time
 import warnings
@@ -66,7 +68,9 @@ class CommandInputTextView(AppKit.NSTextView):
         if window is not None:
             window.performWindowDragWithEvent_(event)
             # After dragging, treat the window's screen as the active screen.
+            # Reset follow mode so a prior manual screen override doesn't block this.
             try:
+                self.controller._follow_command_bar = True
                 self.controller._sync_active_screen_to_command_bar(announce=True)
             except Exception:
                 pass
@@ -686,6 +690,637 @@ class ScreenOCR:
         return items
 
 
+# ── Step type metadata ────────────────────────────────────────────────────────
+
+_STEP_TYPES = [
+    "wait", "key-press", "find", "find-wait",
+    "smart-click", "smart-rclick", "smart-dclick",
+    "click-at", "rclick-at", "dclick-at", "click-relative",
+    "capture", "clear", "run", "find-image", "type", "type-keys",
+]
+
+_KEY_NAMES = ["down", "up", "left", "right", "page-down", "page-up"]
+
+
+def _parse_smart_click_arg(arg):
+    """Parse the argument portion of a smart-click step. Returns (query, x_pct, y_pct)."""
+    query, x_pct, y_pct = "", None, None
+    if not arg:
+        return query, x_pct, y_pct
+    if arg.startswith('"'):
+        end = arg.find('"', 1)
+        if end >= 0:
+            query = arg[1:end]
+            rest = arg[end + 1:].strip()
+            parts = rest.split()
+            if len(parts) >= 2:
+                try:
+                    x_pct, y_pct = float(parts[0]), float(parts[1])
+                except ValueError:
+                    pass
+    else:
+        parts = arg.split()
+        if parts:
+            query = parts[0]
+            if len(parts) >= 3:
+                try:
+                    x_pct, y_pct = float(parts[1]), float(parts[2])
+                except ValueError:
+                    pass
+    return query, x_pct, y_pct
+
+
+class MacroEditorWindow(AppKit.NSObject):
+    """Two-panel graphical macro editor."""
+
+    # ── Init ─────────────────────────────────────────────────────────────────
+
+    def initWithController_(self, controller):
+        self = objc_super(MacroEditorWindow, self).init()
+        if self is None:
+            return None
+        self.controller = controller
+        self._macro_names = []
+        self._selected_macro = None
+        self._steps = []
+        self._sheet = None
+        self._editing_row = None
+        self._editing_insert_at = None
+        self._build_window()
+        return self
+
+    # ── Window construction ───────────────────────────────────────────────────
+
+    def _build_window(self):
+        style = (
+            AppKit.NSWindowStyleMaskTitled
+            | AppKit.NSWindowStyleMaskClosable
+            | AppKit.NSWindowStyleMaskResizable
+            | AppKit.NSWindowStyleMaskMiniaturizable
+        )
+        rect = AppKit.NSMakeRect(200, 200, 800, 520)
+        self.window = AppKit.NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+            rect, style, AppKit.NSBackingStoreBuffered, False
+        )
+        self.window.setTitle_("Glass – Macro Editor")
+        self.window.setDelegate_(self)
+        self.window.setReleasedWhenClosed_(False)
+        self.window.setMinSize_(AppKit.NSMakeSize(600, 350))
+
+        content = self.window.contentView()
+        self._build_content(content)
+
+    def _build_content(self, content):
+        LEFT_W = 210
+        BTN_H = 24
+        BTN_AREA_H = BTN_H + 16   # fixed-height bottom strip for buttons
+        SEP_W = 1
+
+        # ── Vertical separator ────────────────────────────────────────────────
+        sep = AppKit.NSBox.alloc().initWithFrame_(
+            AppKit.NSMakeRect(LEFT_W, 0, SEP_W, 520)
+        )
+        sep.setBoxType_(AppKit.NSBoxSeparator)
+        sep.setAutoresizingMask_(AppKit.NSViewHeightSizable)
+        content.addSubview_(sep)
+
+        # ── Left: macro list ──────────────────────────────────────────────────
+        macro_scroll = AppKit.NSScrollView.alloc().initWithFrame_(
+            AppKit.NSMakeRect(0, BTN_AREA_H, LEFT_W, 520 - BTN_AREA_H)
+        )
+        macro_scroll.setHasVerticalScroller_(True)
+        macro_scroll.setAutohidesScrollers_(True)
+        macro_scroll.setBorderType_(AppKit.NSNoBorder)
+        macro_scroll.setAutoresizingMask_(AppKit.NSViewHeightSizable)
+
+        self.macro_table = AppKit.NSTableView.alloc().initWithFrame_(
+            AppKit.NSMakeRect(0, 0, LEFT_W, 520 - BTN_AREA_H)
+        )
+        col = AppKit.NSTableColumn.alloc().initWithIdentifier_("name")
+        col.setTitle_("Macros")
+        col.setEditable_(False)
+        col.setMinWidth_(80)
+        self.macro_table.addTableColumn_(col)
+        self.macro_table.setHeaderView_(None)
+        self.macro_table.setDataSource_(self)
+        self.macro_table.setDelegate_(self)
+        self.macro_table.setTag_(1)
+        self.macro_table.setAllowsEmptySelection_(True)
+        self.macro_table.setUsesAlternatingRowBackgroundColors_(True)
+        macro_scroll.setDocumentView_(self.macro_table)
+        content.addSubview_(macro_scroll)
+
+        # Left buttons
+        BY = 8
+        new_btn = self._make_button("+ New", AppKit.NSMakeRect(8, BY, 54, BTN_H), "newMacro:")
+        ren_btn = self._make_button("Rename", AppKit.NSMakeRect(68, BY, 64, BTN_H), "renameMacro:")
+        del_macro_btn = self._make_button("Delete", AppKit.NSMakeRect(138, BY, 60, BTN_H), "deleteMacro:")
+        for b in (new_btn, ren_btn, del_macro_btn):
+            content.addSubview_(b)
+
+        # ── Right: step list ──────────────────────────────────────────────────
+        RX = LEFT_W + SEP_W
+        step_scroll = AppKit.NSScrollView.alloc().initWithFrame_(
+            AppKit.NSMakeRect(RX, BTN_AREA_H, 800 - RX, 520 - BTN_AREA_H)
+        )
+        step_scroll.setHasVerticalScroller_(True)
+        step_scroll.setAutohidesScrollers_(True)
+        step_scroll.setBorderType_(AppKit.NSNoBorder)
+        step_scroll.setAutoresizingMask_(AppKit.NSViewWidthSizable | AppKit.NSViewHeightSizable)
+
+        self.step_table = AppKit.NSTableView.alloc().initWithFrame_(
+            AppKit.NSMakeRect(0, 0, 800 - RX, 520 - BTN_AREA_H)
+        )
+        num_col = AppKit.NSTableColumn.alloc().initWithIdentifier_("num")
+        num_col.setTitle_("#")
+        num_col.setWidth_(32)
+        num_col.setMinWidth_(32)
+        num_col.setMaxWidth_(32)
+        num_col.setEditable_(False)
+        self.step_table.addTableColumn_(num_col)
+
+        step_col = AppKit.NSTableColumn.alloc().initWithIdentifier_("step")
+        step_col.setTitle_("Step")
+        step_col.setEditable_(False)
+        step_col.setMinWidth_(200)
+        self.step_table.addTableColumn_(step_col)
+
+        self.step_table.setDataSource_(self)
+        self.step_table.setDelegate_(self)
+        self.step_table.setTag_(2)
+        self.step_table.setAllowsEmptySelection_(True)
+        self.step_table.setUsesAlternatingRowBackgroundColors_(True)
+        self.step_table.setDoubleAction_("editStep:")
+        self.step_table.setTarget_(self)
+        step_scroll.setDocumentView_(self.step_table)
+        content.addSubview_(step_scroll)
+
+        # Right buttons
+        up_btn = self._make_button("↑", AppKit.NSMakeRect(RX + 8, BY, 30, BTN_H), "moveStepUp:")
+        dn_btn = self._make_button("↓", AppKit.NSMakeRect(RX + 42, BY, 30, BTN_H), "moveStepDown:")
+        add_btn = self._make_button("+ Add Step", AppKit.NSMakeRect(RX + 80, BY, 86, BTN_H), "addStep:")
+        edit_btn = self._make_button("Edit", AppKit.NSMakeRect(RX + 172, BY, 50, BTN_H), "editStep:")
+        dup_btn = self._make_button("Duplicate", AppKit.NSMakeRect(RX + 228, BY, 76, BTN_H), "duplicateStep:")
+        del_step_btn = self._make_button("Delete Step", AppKit.NSMakeRect(RX + 310, BY, 86, BTN_H), "deleteStep:")
+        for b in (up_btn, dn_btn, add_btn, edit_btn, dup_btn, del_step_btn):
+            b.setAutoresizingMask_(AppKit.NSViewMinXMargin)
+            content.addSubview_(b)
+
+    def _make_button(self, title, rect, action):
+        btn = AppKit.NSButton.alloc().initWithFrame_(rect)
+        btn.setTitle_(title)
+        btn.setBezelStyle_(AppKit.NSBezelStyleRounded)
+        btn.setButtonType_(AppKit.NSButtonTypeMomentaryPushIn)
+        btn.setTarget_(self)
+        btn.setAction_(action)
+        return btn
+
+    # ── NSTableView data source ───────────────────────────────────────────────
+
+    def numberOfRowsInTableView_(self, table_view):
+        if table_view.tag() == 1:
+            return len(self._macro_names)
+        return len(self._steps)
+
+    def tableView_objectValueForTableColumn_row_(self, table_view, column, row):
+        if table_view.tag() == 1:
+            if 0 <= row < len(self._macro_names):
+                return self._macro_names[row]
+            return ""
+        # Step table
+        col_id = str(column.identifier())
+        if col_id == "num":
+            return str(row + 1)
+        if 0 <= row < len(self._steps):
+            return self._steps[row]
+        return ""
+
+    # ── NSTableView delegate ──────────────────────────────────────────────────
+
+    def tableViewSelectionDidChange_(self, notification):
+        table_view = notification.object()
+        if table_view.tag() == 1:
+            row = table_view.selectedRow()
+            self._selected_macro = self._macro_names[row] if 0 <= row < len(self._macro_names) else None
+            self._reload_step_list()
+
+    # ── Reload helpers ────────────────────────────────────────────────────────
+
+    def _reload_macro_list(self, select=None):
+        self._macro_names = sorted(self.controller.macros.keys())
+        self.macro_table.reloadData()
+        target = select or self._selected_macro
+        if target and target in self._macro_names:
+            idx = self._macro_names.index(target)
+            self.macro_table.selectRowIndexes_byExtendingSelection_(
+                Foundation.NSIndexSet.indexSetWithIndex_(idx), False
+            )
+            self._selected_macro = target
+        elif self._macro_names:
+            self.macro_table.selectRowIndexes_byExtendingSelection_(
+                Foundation.NSIndexSet.indexSetWithIndex_(0), False
+            )
+            self._selected_macro = self._macro_names[0]
+        else:
+            self._selected_macro = None
+        self._reload_step_list()
+
+    def _reload_step_list(self):
+        if self._selected_macro and self._selected_macro in self.controller.macros:
+            self._steps = list(self.controller._get_macro_steps(self._selected_macro))
+        else:
+            self._steps = []
+        self.step_table.reloadData()
+        self.step_table.deselectAll_(None)
+        # Update window subtitle to show active macro
+        title = f"Glass – Macro Editor"
+        if self._selected_macro:
+            title += f"  —  {self._selected_macro}"
+        self.window.setTitle_(title)
+
+    def _save_current_steps(self):
+        """Persist self._steps back to controller.macros and save to disk."""
+        if not self._selected_macro:
+            return
+        macro = self.controller.macros.get(self._selected_macro)
+        if macro is None:
+            return
+        if isinstance(macro, dict):
+            macro["steps"] = list(self._steps)
+        else:
+            self.controller.macros[self._selected_macro] = list(self._steps)
+        self.controller._save_macros()
+        self.step_table.reloadData()
+
+    def _select_step_row(self, row):
+        if 0 <= row < len(self._steps):
+            self.step_table.selectRowIndexes_byExtendingSelection_(
+                Foundation.NSIndexSet.indexSetWithIndex_(row), False
+            )
+            self.step_table.scrollRowToVisible_(row)
+
+    # ── Macro actions ─────────────────────────────────────────────────────────
+
+    def newMacro_(self, sender):
+        base, i, name = "new-macro", 1, "new-macro"
+        while name in self.controller.macros:
+            name = f"{base}-{i}"
+            i += 1
+        self.controller.macros[name] = {"v": 2, "resolution": [], "steps": []}
+        self.controller._save_macros()
+        self._reload_macro_list(select=name)
+        # Immediately prompt for a name
+        self.renameMacro_(None)
+
+    def renameMacro_(self, sender):
+        if not self._selected_macro:
+            return
+        alert = AppKit.NSAlert.alloc().init()
+        alert.setMessageText_("Rename macro")
+        alert.addButtonWithTitle_("Rename")
+        alert.addButtonWithTitle_("Cancel")
+        field = AppKit.NSTextField.alloc().initWithFrame_(AppKit.NSMakeRect(0, 0, 260, 22))
+        field.setStringValue_(self._selected_macro)
+        alert.setAccessoryView_(field)
+        alert.window().setInitialFirstResponder_(field)
+        if alert.runModal() == AppKit.NSAlertFirstButtonReturn:
+            new_name = str(field.stringValue()).strip().lower().replace(" ", "-")
+            old_name = self._selected_macro
+            if new_name and new_name != old_name and new_name not in self.controller.macros:
+                self.controller.macros[new_name] = self.controller.macros.pop(old_name)
+                self.controller._save_macros()
+                self._reload_macro_list(select=new_name)
+
+    def deleteMacro_(self, sender):
+        if not self._selected_macro:
+            return
+        name = self._selected_macro
+        alert = AppKit.NSAlert.alloc().init()
+        alert.setMessageText_(f'Delete macro "{name}"?')
+        alert.setInformativeText_("This cannot be undone.")
+        alert.addButtonWithTitle_("Delete")
+        alert.addButtonWithTitle_("Cancel")
+        alert.setAlertStyle_(AppKit.NSAlertStyleWarning)
+        if alert.runModal() == AppKit.NSAlertFirstButtonReturn:
+            del self.controller.macros[name]
+            self.controller._save_macros()
+            self._selected_macro = None
+            self._reload_macro_list()
+
+    # ── Step actions ──────────────────────────────────────────────────────────
+
+    def moveStepUp_(self, sender):
+        row = self.step_table.selectedRow()
+        if row <= 0 or row >= len(self._steps):
+            return
+        self._steps[row - 1], self._steps[row] = self._steps[row], self._steps[row - 1]
+        self._save_current_steps()
+        self._select_step_row(row - 1)
+
+    def moveStepDown_(self, sender):
+        row = self.step_table.selectedRow()
+        if row < 0 or row >= len(self._steps) - 1:
+            return
+        self._steps[row], self._steps[row + 1] = self._steps[row + 1], self._steps[row]
+        self._save_current_steps()
+        self._select_step_row(row + 1)
+
+    def addStep_(self, sender):
+        if not self._selected_macro:
+            return
+        sel = self.step_table.selectedRow()
+        insert_at = (sel + 1) if sel >= 0 else len(self._steps)
+        self._show_step_editor(row=None, insert_at=insert_at)
+
+    def editStep_(self, sender):
+        row = self.step_table.selectedRow()
+        if row < 0 or row >= len(self._steps):
+            return
+        self._show_step_editor(row=row, insert_at=None)
+
+    def deleteStep_(self, sender):
+        row = self.step_table.selectedRow()
+        if row < 0 or row >= len(self._steps):
+            return
+        del self._steps[row]
+        self._save_current_steps()
+        self._select_step_row(min(row, len(self._steps) - 1))
+
+    def duplicateStep_(self, sender):
+        row = self.step_table.selectedRow()
+        if row < 0 or row >= len(self._steps):
+            return
+        self._steps.insert(row + 1, self._steps[row])
+        self._save_current_steps()
+        self._select_step_row(row + 1)
+
+    # ── Step editor sheet ─────────────────────────────────────────────────────
+
+    def _show_step_editor(self, row, insert_at):
+        self._editing_row = row
+        self._editing_insert_at = insert_at
+        existing = self._steps[row] if row is not None else ""
+
+        sheet_w, sheet_h = 500, 240
+        sheet_rect = AppKit.NSMakeRect(0, 0, sheet_w, sheet_h)
+        self._sheet = AppKit.NSPanel.alloc().initWithContentRect_styleMask_backing_defer_(
+            sheet_rect,
+            AppKit.NSWindowStyleMaskTitled,
+            AppKit.NSBackingStoreBuffered,
+            False,
+        )
+        self._sheet.setTitle_("Edit Step" if row is not None else "Add Step")
+        c = self._sheet.contentView()
+
+        def label(text, x, y, w=110):
+            f = AppKit.NSTextField.alloc().initWithFrame_(AppKit.NSMakeRect(x, y, w, 22))
+            f.setStringValue_(text)
+            f.setEditable_(False)
+            f.setBordered_(False)
+            f.setDrawsBackground_(False)
+            f.setAlignment_(AppKit.NSTextAlignmentRight)
+            c.addSubview_(f)
+            return f
+
+        def field(x, y, w=340):
+            f = AppKit.NSTextField.alloc().initWithFrame_(AppKit.NSMakeRect(x, y, w, 22))
+            c.addSubview_(f)
+            return f
+
+        def popup(x, y, w, items):
+            p = AppKit.NSPopUpButton.alloc().initWithFrame_(AppKit.NSMakeRect(x, y, w, 26))
+            for item in items:
+                p.addItemWithTitle_(item)
+            c.addSubview_(p)
+            return p
+
+        # Row 1: step type
+        label("Step type:", 12, 192)
+        self._se_type_popup = popup(128, 190, 220, _STEP_TYPES)
+        self._se_type_popup.setAction_("_seTypeChanged:")
+        self._se_type_popup.setTarget_(self)
+
+        # Row 2: primary argument (label + text field or dropdown)
+        self._se_arg1_label = label("", 12, 152)
+        self._se_arg1_field = field(128, 152)
+        self._se_key_popup = popup(128, 150, 200, _KEY_NAMES)
+        self._se_run_popup = popup(128, 150, 220, sorted(self.controller.macros.keys()))
+        images_dir = self.controller.images_path
+        img_names = sorted(
+            f[:-4] for f in os.listdir(images_dir) if f.endswith(".png")
+        ) if os.path.isdir(images_dir) else []
+        self._se_img_popup = popup(128, 150, 220, img_names or ["(no images)"])
+
+        # Row 3: X coordinate
+        self._se_x_label = label("", 12, 112)
+        self._se_x_field = field(128, 112, 120)
+
+        # Row 4: Y coordinate  (shares row 3 line, offset to the right)
+        self._se_y_label = label("", 270, 112, 30)
+        self._se_y_field = field(306, 112, 120)
+
+        # OK / Cancel
+        ok = AppKit.NSButton.alloc().initWithFrame_(AppKit.NSMakeRect(sheet_w - 108, 12, 90, 32))
+        ok.setTitle_("OK")
+        ok.setBezelStyle_(AppKit.NSBezelStyleRounded)
+        ok.setKeyEquivalent_("\r")
+        ok.setTarget_(self)
+        ok.setAction_("_seOK:")
+        c.addSubview_(ok)
+
+        cancel = AppKit.NSButton.alloc().initWithFrame_(AppKit.NSMakeRect(sheet_w - 206, 12, 90, 32))
+        cancel.setTitle_("Cancel")
+        cancel.setBezelStyle_(AppKit.NSBezelStyleRounded)
+        cancel.setKeyEquivalent_("\x1b")
+        cancel.setTarget_(self)
+        cancel.setAction_("_seCancel:")
+        c.addSubview_(cancel)
+
+        self._se_populate(existing)
+        self.window.beginSheet_completionHandler_(self._sheet, None)
+
+    def _se_populate(self, step_str):
+        """Parse step_str and set sheet fields accordingly."""
+        step_str = step_str.strip()
+        parts = step_str.split(" ", 1) if step_str else []
+        step_type = parts[0].lower() if parts else "wait"
+        arg = parts[1].strip() if len(parts) > 1 else ""
+
+        # Select type in popup
+        for i in range(self._se_type_popup.numberOfItems()):
+            if self._se_type_popup.itemTitleAtIndex_(i) == step_type:
+                self._se_type_popup.selectItemAtIndex_(i)
+                break
+
+        self._se_apply_type(step_type, arg)
+
+    def _se_apply_type(self, step_type, arg=""):
+        """Show/hide sheet fields for the given step type."""
+        # Hide all dynamic controls first
+        for w in (self._se_arg1_field, self._se_key_popup, self._se_run_popup,
+                  self._se_img_popup, self._se_x_field, self._se_y_field):
+            w.setHidden_(True)
+        for lbl in (self._se_arg1_label, self._se_x_label, self._se_y_label):
+            lbl.setStringValue_("")
+
+        if step_type == "wait":
+            self._se_arg1_label.setStringValue_("Seconds:")
+            self._se_arg1_field.setStringValue_(arg if arg else "1.0")
+            self._se_arg1_field.setHidden_(False)
+
+        elif step_type == "key-press":
+            self._se_arg1_label.setStringValue_("Key:")
+            self._se_key_popup.setHidden_(False)
+            self._se_select_popup(self._se_key_popup, arg)
+
+        elif step_type == "find":
+            self._se_arg1_label.setStringValue_("Text:")
+            self._se_arg1_field.setStringValue_(arg)
+            self._se_arg1_field.setHidden_(False)
+
+        elif step_type in ("smart-click", "smart-rclick", "smart-dclick"):
+            query, x_pct, y_pct = _parse_smart_click_arg(arg)
+            self._se_arg1_label.setStringValue_("Query text:")
+            self._se_arg1_field.setStringValue_(query)
+            self._se_arg1_field.setHidden_(False)
+            self._se_x_label.setStringValue_("X (0–1):")
+            self._se_x_field.setStringValue_(f"{x_pct:.4f}" if x_pct is not None else "0.5000")
+            self._se_x_field.setHidden_(False)
+            self._se_y_label.setStringValue_("Y:")
+            self._se_y_field.setStringValue_(f"{y_pct:.4f}" if y_pct is not None else "0.5000")
+            self._se_y_field.setHidden_(False)
+
+        elif step_type in ("click-at", "rclick-at", "dclick-at"):
+            parts = arg.split()
+            self._se_x_label.setStringValue_("X (0–1):")
+            self._se_x_field.setStringValue_(parts[0] if parts else "0.5000")
+            self._se_x_field.setHidden_(False)
+            self._se_y_label.setStringValue_("Y:")
+            self._se_y_field.setStringValue_(parts[1] if len(parts) > 1 else "0.5000")
+            self._se_y_field.setHidden_(False)
+
+        elif step_type == "click-relative":
+            self._se_arg1_label.setStringValue_("Index dX dY:")
+            self._se_arg1_field.setStringValue_(arg if arg else "1 0.0000 0.0000")
+            self._se_arg1_field.setHidden_(False)
+
+        elif step_type == "run":
+            self._se_arg1_label.setStringValue_("Macro:")
+            self._se_run_popup.setHidden_(False)
+            self._se_select_popup(self._se_run_popup, arg)
+
+        elif step_type == "find-image":
+            self._se_arg1_label.setStringValue_("Image:")
+            self._se_img_popup.setHidden_(False)
+            self._se_select_popup(self._se_img_popup, arg)
+
+        elif step_type == "type":
+            self._se_arg1_label.setStringValue_("Text ({date} = today):")
+            self._se_arg1_field.setStringValue_(arg.strip('"'))
+            self._se_arg1_field.setHidden_(False)
+
+        # capture / clear: no parameters — everything stays hidden
+
+    def _se_select_popup(self, popup, value):
+        for i in range(popup.numberOfItems()):
+            if popup.itemTitleAtIndex_(i) == value:
+                popup.selectItemAtIndex_(i)
+                return
+
+    def _seTypeChanged_(self, sender):
+        step_type = str(self._se_type_popup.titleOfSelectedItem())
+        self._se_apply_type(step_type)
+
+    def _se_build_step(self):
+        """Assemble the step string from current sheet field values."""
+        t = str(self._se_type_popup.titleOfSelectedItem())
+
+        if t == "wait":
+            raw = str(self._se_arg1_field.stringValue()).strip()
+            try:
+                val = f"{float(raw):.1f}"
+            except ValueError:
+                val = "1.0"
+            return f"wait {val}"
+
+        if t == "key-press":
+            return f"key-press {self._se_key_popup.titleOfSelectedItem()}"
+
+        if t in ("find", "type", "type-keys"):
+            text = str(self._se_arg1_field.stringValue()).strip()
+            return f"{t} {text}" if text else t
+
+        if t in ("smart-click", "smart-rclick", "smart-dclick"):
+            query = str(self._se_arg1_field.stringValue()).strip()
+            try:
+                x = float(str(self._se_x_field.stringValue()).strip())
+            except ValueError:
+                x = 0.5
+            try:
+                y = float(str(self._se_y_field.stringValue()).strip())
+            except ValueError:
+                y = 0.5
+            escaped = query.replace('"', '\\"')
+            return f'{t} "{escaped}" {x:.4f} {y:.4f}'
+
+        if t in ("click-at", "rclick-at", "dclick-at"):
+            try:
+                x = float(str(self._se_x_field.stringValue()).strip())
+            except ValueError:
+                x = 0.5
+            try:
+                y = float(str(self._se_y_field.stringValue()).strip())
+            except ValueError:
+                y = 0.5
+            return f"{t} {x:.4f} {y:.4f}"
+
+        if t == "click-relative":
+            raw = str(self._se_arg1_field.stringValue()).strip()
+            return f"{t} {raw}" if raw else t
+
+        if t == "run":
+            name = str(self._se_run_popup.titleOfSelectedItem())
+            return f"run {name}"
+
+        if t == "find-image":
+            name = str(self._se_img_popup.titleOfSelectedItem())
+            return f"find-image {name}"
+
+        return t  # capture / clear
+
+    def _seOK_(self, sender):
+        step_str = self._se_build_step()
+        self.window.endSheet_(self._sheet)
+        self._sheet.orderOut_(None)
+        self._sheet = None
+        if self._editing_row is not None:
+            self._steps[self._editing_row] = step_str
+            target_row = self._editing_row
+        else:
+            at = self._editing_insert_at if self._editing_insert_at is not None else len(self._steps)
+            self._steps.insert(at, step_str)
+            target_row = at
+        self._save_current_steps()
+        self._select_step_row(target_row)
+
+    def _seCancel_(self, sender):
+        self.window.endSheet_(self._sheet)
+        self._sheet.orderOut_(None)
+        self._sheet = None
+
+    # ── Window delegate ───────────────────────────────────────────────────────
+
+    def windowWillClose_(self, notification):
+        pass  # window is reused; no teardown needed
+
+    # ── Public API ────────────────────────────────────────────────────────────
+
+    def show(self, macro_name=None):
+        self._reload_macro_list(select=macro_name)
+        self.window.makeKeyAndOrderFront_(None)
+        AppKit.NSApp.activateIgnoringOtherApps_(True)
+
+
 class AppController(AppKit.NSObject):
     def init(self):
         self = objc_super(AppController, self).init()
@@ -737,6 +1372,7 @@ class AppController(AppKit.NSObject):
         self._recording_name = None
         self._recording_steps = []
         self._recording_mouse_monitor = None
+        self._recording_key_monitor = None
         self._macro_running = False
         self._macro_queue = []
         self._macro_name = None
@@ -748,7 +1384,11 @@ class AppController(AppKit.NSObject):
         self._pending_image_name = None
         self._command_history = []
         self._history_index = -1
+        self._macro_editor = None
         self._load_macros()
+        self._macros_mtime_ns = self._macros_file_mtime_ns()
+        self._macro_watch_timer = None
+        self._start_macro_watch_timer()
         self._setup_hotkey()
         self._status_flash_token = 0
         return self
@@ -1023,11 +1663,44 @@ class AppController(AppKit.NSObject):
                 normalized[name] = value
         self.macros = normalized
 
+    def _macros_file_mtime_ns(self):
+        try:
+            return os.stat(self.macros_path).st_mtime_ns
+        except OSError:
+            return None
+
+    def _reload_macros_if_changed(self):
+        current_mtime = self._macros_file_mtime_ns()
+        if current_mtime is None:
+            return False
+        if current_mtime == getattr(self, "_macros_mtime_ns", None):
+            return False
+
+        editor = getattr(self, "_macro_editor", None)
+        selected_macro = getattr(editor, "_selected_macro", None) if editor is not None else None
+        self._load_macros()
+        self._macros_mtime_ns = current_mtime
+        if editor is not None:
+            editor._reload_macro_list(select=selected_macro)
+        print("DEBUG macros: reloaded macros.json from disk")
+        return True
+
+    def _start_macro_watch_timer(self):
+        if getattr(self, "_macro_watch_timer", None) is not None:
+            return
+        self._macro_watch_timer = AppKit.NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+            1.0, self, "macroWatchTimerFired:", None, True
+        )
+
+    def macroWatchTimerFired_(self, timer):
+        self._reload_macros_if_changed()
+
     def _save_macros(self):
         path = self.macros_path
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w", encoding="utf-8") as handle:
             json.dump({"macros": self.macros}, handle, indent=2)
+        self._macros_mtime_ns = self._macros_file_mtime_ns()
 
     def _get_macro_steps(self, name):
         """Get steps from a macro, handling both v1 (array) and v2 (object) formats."""
@@ -1091,15 +1764,17 @@ class AppController(AppKit.NSObject):
         )
         # Track time for wait insertion
         self._recording_last_action_time = time.time()
-        # Start global mouse click monitoring
+        # Start global mouse click and key monitoring
         self._start_recording_mouse_monitor()
+        self._start_recording_key_monitor()
         res_str = f"{self._recording_resolution[0]}x{self._recording_resolution[1]}"
         self.command_bar.set_status(f"Recording {name} ({res_str}) - click anywhere")
 
     def _stop_recording(self):
         print(f"DEBUG _stop_recording: _recording_name={self._recording_name}, steps={self._recording_steps}")
-        # Stop mouse monitoring first
+        # Stop mouse and key monitoring first
         self._stop_recording_mouse_monitor()
+        self._stop_recording_key_monitor()
         if self._recording_name is None:
             self.command_bar.set_status("Not recording")
             return
@@ -1139,6 +1814,52 @@ class AppController(AppKit.NSObject):
             AppKit.NSEvent.removeMonitor_(self._recording_mouse_monitor)
             self._recording_mouse_monitor = None
             print("DEBUG: Stopped recording mouse monitor")
+
+    # Navigation key codes to capture during recording
+    _NAV_KEY_CODES = {
+        125: "down",
+        126: "up",
+        123: "left",
+        124: "right",
+        121: "page-down",
+        116: "page-up",
+    }
+
+    def _start_recording_key_monitor(self):
+        """Start global key monitoring for navigation keys during recording."""
+        if self._recording_key_monitor is not None:
+            return
+        self._recording_key_monitor = AppKit.NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(
+            AppKit.NSEventMaskKeyDown, self._handle_recording_key_press
+        )
+        print("DEBUG: Started recording key monitor")
+
+    def _stop_recording_key_monitor(self):
+        """Stop global key monitoring."""
+        if self._recording_key_monitor is not None:
+            AppKit.NSEvent.removeMonitor_(self._recording_key_monitor)
+            self._recording_key_monitor = None
+            print("DEBUG: Stopped recording key monitor")
+
+    def _handle_recording_key_press(self, event):
+        """Handle a global key press during recording (navigation keys only)."""
+        if self._recording_name is None:
+            return
+        key_code = event.keyCode()
+        key_name = self._NAV_KEY_CODES.get(key_code)
+        if key_name is None:
+            return
+        print(f"DEBUG _handle_recording_key_press: key={key_name} (code={key_code})")
+        # Insert a wait step if enough time has passed since the last recorded action
+        if self._recording_last_action_time is not None:
+            elapsed = time.time() - self._recording_last_action_time
+            if elapsed > 0.5:
+                wait_time = min(10.0, round(elapsed * 2) / 2)
+                self._recording_steps.append(f"wait {wait_time:.1f}")
+        self._recording_steps.append(f"key-press {key_name}")
+        self._recording_last_action_time = time.time()
+        step_count = len(self._recording_steps)
+        run_on_main(lambda: self.command_bar.set_status(f"Recording {self._recording_name} ({step_count} steps)"))
 
     def _handle_recording_mouse_click(self, event):
         """Handle a global mouse click during recording."""
@@ -1284,6 +2005,14 @@ class AppController(AppKit.NSObject):
         self.command_bar.set_status(f"Macros ({len(names)})")
         self.command_bar.show_help("\n".join(names))
 
+    def _open_macro_editor(self, macro_name=None):
+        """Open (or re-show) the graphical macro editor."""
+        if self._macro_editor is None:
+            self._macro_editor = MacroEditorWindow.alloc().initWithController_(self)
+        name = self._normalize_macro_name(macro_name) if macro_name else None
+        self._macro_editor.show(macro_name=name)
+        self.command_bar.hide()
+
     def _show_macro(self, name):
         name = self._normalize_macro_name(name)
         if not name:
@@ -1380,9 +2109,42 @@ class AppController(AppKit.NSObject):
         # Now run find-image to show matches
         self._find_image(name)
 
-    def _find_image(self, name):
-        """Find a saved image template on screen using template matching."""
-        name = self._normalize_macro_name(name)
+    def _find_image(self, arg_str):
+        """Find a saved image template on screen using multi-scale template matching.
+
+        Format: find-image <name> [x_pct y_pct] [--attempts N]
+        Optional coordinates select the closest match to that position.
+        """
+        parts = arg_str.strip().split()
+        name = self._normalize_macro_name(parts[0]) if parts else ""
+        hint_x, hint_y = None, None
+        click_attempts = 2
+        idx = 1
+        while idx < len(parts):
+            token = parts[idx]
+            if token == "--attempts" and idx + 1 < len(parts):
+                try:
+                    click_attempts = max(1, min(5, int(parts[idx + 1])))
+                except ValueError:
+                    pass
+                idx += 2
+                continue
+            if token.startswith("attempts="):
+                try:
+                    click_attempts = max(1, min(5, int(token.split("=", 1)[1])))
+                except ValueError:
+                    pass
+                idx += 1
+                continue
+            if hint_x is None and hint_y is None and idx + 1 < len(parts):
+                try:
+                    hint_x = float(parts[idx])
+                    hint_y = float(parts[idx + 1])
+                    idx += 2
+                    continue
+                except ValueError:
+                    pass
+            idx += 1
         if not name:
             self.command_bar.set_status("Missing image name")
             return
@@ -1394,14 +2156,16 @@ class AppController(AppKit.NSObject):
             return
         self._macro_wait_reason = "find-image"
         self.command_bar.set_status(f"Finding '{name}'...")
-        # Load template
-        template = cv2.imread(image_path, cv2.IMREAD_COLOR)
-        if template is None:
+        # Load template in grayscale for robustness
+        template_color = cv2.imread(image_path, cv2.IMREAD_COLOR)
+        if template_color is None:
             self.command_bar.set_status(f"Failed to load image: {name}")
             if self._macro_wait_reason == "find-image":
                 self._abort_macro(f"Failed to load image: {name}")
             return
-        template_h, template_w = template.shape[:2]
+        template_gray = cv2.cvtColor(template_color, cv2.COLOR_BGR2GRAY)
+        template_h, template_w = template_gray.shape[:2]
+        print(f"DEBUG _find_image: template '{name}' size={template_w}x{template_h}")
         # Capture screen
         display_id = self._active_display_id
         screen_bounds = Quartz.CGDisplayBounds(display_id)
@@ -1417,32 +2181,50 @@ class AppController(AppKit.NSObject):
                 self._abort_macro("Screen capture failed")
             return
         # Convert CGImage to numpy array
-        width = Quartz.CGImageGetWidth(screen_image)
-        height = Quartz.CGImageGetHeight(screen_image)
+        px_width = Quartz.CGImageGetWidth(screen_image)
+        px_height = Quartz.CGImageGetHeight(screen_image)
         bytes_per_row = Quartz.CGImageGetBytesPerRow(screen_image)
         data_provider = Quartz.CGImageGetDataProvider(screen_image)
         data = Quartz.CGDataProviderCopyData(data_provider)
         arr = np.frombuffer(data, dtype=np.uint8)
-        arr = arr.reshape((height, bytes_per_row // 4, 4))
-        # CGWindowListCreateImage returns BGRA format on macOS (little-endian with alpha first)
-        # Extract first 3 channels to get BGR, which matches cv2.imread format
-        screen_bgr = arr[:, :width, :3].copy()
-        # Template matching
-        result = cv2.matchTemplate(screen_bgr, template, cv2.TM_CCOEFF_NORMED)
-        threshold = 0.8
-        locations = np.where(result >= threshold)
+        arr = arr.reshape((px_height, bytes_per_row // 4, 4))
+        screen_bgr = arr[:, :px_width, :3].copy()
+        screen_gray = cv2.cvtColor(screen_bgr, cv2.COLOR_BGR2GRAY)
+        print(f"DEBUG _find_image: screen size={px_width}x{px_height}")
+        # Multi-scale matching: try a range of scales to handle size differences
+        pixel_scale = px_width / self.screen_frame.size.width  # retina scale factor
+        scales = [0.5, 0.75, 1.0, 1.5, 2.0]
+        threshold = 0.6
+        best_val = -1.0
+        best_matches = []
+        for s in scales:
+            tw = max(1, int(template_w * s))
+            th = max(1, int(template_h * s))
+            if tw > px_width or th > px_height:
+                continue
+            scaled = cv2.resize(template_gray, (tw, th), interpolation=cv2.INTER_AREA)
+            result = cv2.matchTemplate(screen_gray, scaled, cv2.TM_CCOEFF_NORMED)
+            _, max_val, _, _ = cv2.minMaxLoc(result)
+            if max_val > best_val:
+                best_val = max_val
+            if max_val < threshold:
+                continue
+            locations = np.where(result >= threshold)
+            for pt in zip(*locations[::-1]):
+                best_matches.append((pt, tw, th, s, float(result[pt[1], pt[0]])))
+        print(f"DEBUG _find_image: best score={best_val:.3f}, raw hits={len(best_matches)}")
+        # Convert pixel coords to point coords and deduplicate
+        pt_scale = px_width / self.screen_frame.size.width
         matches = []
-        # Convert to screen coordinates (accounting for Retina scale)
-        scale = width / self.screen_frame.size.width
-        for pt in zip(*locations[::-1]):  # Switch to (x, y)
-            x_pt = pt[0] / scale
-            y_pt = pt[1] / scale
-            w_pt = template_w / scale
-            h_pt = template_h / scale
-            matches.append({"text": name, "bbox": (x_pt, y_pt, w_pt, h_pt), "query": name, "type": "image"})
+        for pt, tw, th, s, score in best_matches:
+            x_pt = pt[0] / pt_scale
+            y_pt = pt[1] / pt_scale
+            w_pt = tw / pt_scale
+            h_pt = th / pt_scale
+            matches.append({"text": name, "bbox": (x_pt, y_pt, w_pt, h_pt), "query": name, "type": "image", "score": score})
         # Deduplicate overlapping matches
         filtered = []
-        for m in matches:
+        for m in sorted(matches, key=lambda x: -x["score"]):
             x, y, w, h = m["bbox"]
             duplicate = False
             for f in filtered:
@@ -1452,12 +2234,33 @@ class AppController(AppKit.NSObject):
                     break
             if not duplicate:
                 filtered.append(m)
-        matches = self._order_matches_by_anchor(filtered[:9])
-        self.matches = matches
-        self.overlay.show_matches(matches, self.screen_height)
-        self.command_bar.set_status(f"Found {len(matches)} matches")
+        # If hint coordinates given, sort by proximity to hint; otherwise use anchor
+        if hint_x is not None and hint_y is not None:
+            target_x = hint_x * self.screen_frame.size.width
+            target_y = hint_y * self.screen_frame.size.height
+            def dist_to_hint(m):
+                bx, by, bw, bh = m["bbox"]
+                return (bx + bw/2 - target_x)**2 + (by + bh/2 - target_y)**2
+            filtered = sorted(filtered[:9], key=dist_to_hint)
+        else:
+            filtered = self._order_matches_by_anchor(filtered[:9])
+        print(f"DEBUG _find_image: final matches={len(filtered)}")
+        self.matches = filtered
         if self._macro_running and self._macro_wait_reason == "find-image":
-            self._macro_step_complete()
+            if not filtered:
+                self._abort_macro(f"Image not found on screen: {name} (best={best_val:.2f})")
+                return
+            match = filtered[0]
+            x, y, w, h = match["bbox"]
+            cx, cy = x + w / 2.0, y + h / 2.0
+            print(
+                f"DEBUG _find_image: auto-clicking match at ({cx:.1f}, {cy:.1f}), "
+                f"attempts={click_attempts}"
+            )
+            self._dispatch_macro_click(cx, cy, reason="find-image-click", attempts=click_attempts)
+        else:
+            self.overlay.show_matches(filtered, self.screen_height)
+            self.command_bar.set_status(f"Found {len(filtered)} matches" if filtered else f"No match (best={best_val:.2f})")
 
     def _list_images(self):
         """List all saved image templates."""
@@ -1518,12 +2321,16 @@ class AppController(AppKit.NSObject):
         expanded = self._expand_macro(name)
         if expanded is None:
             return
+        # Do not let the first match selection in a new macro inherit
+        # a stale click anchor from a previous macro run.
+        self.last_click_point = None
         self._macro_name = name
         self._macro_root = name
         self._macro_queue = expanded
         self._macro_running = True
         self._macro_wait_reason = None
         self.command_bar.set_status(f"Running {name}")
+        self.command_bar.hide()
         self._run_next_macro_step()
 
     def _expand_macro(self, name):
@@ -1598,6 +2405,8 @@ class AppController(AppKit.NSObject):
         parts = command.split(" ", 1)
         name = parts[0].lower()
         arg = parts[1].strip() if len(parts) > 1 else ""
+        log_label = command if name not in ("find", "find-wait", "smart-click", "smart-rclick", "smart-dclick", "type", "type-keys") else name
+        print(f"MACRO STEP: {log_label}  (matches={len(self.matches)}, queue={len(self._macro_queue)} remaining)")
         if name == "capture":
             self._macro_wait_reason = "capture"
             self._sync_active_screen_to_command_bar(announce=False)
@@ -1618,9 +2427,18 @@ class AppController(AppKit.NSObject):
             if expanded is None:
                 return
             self._macro_queue = expanded + self._macro_queue
+        elif name == "find-wait":
+            self._macro_wait_reason = "find-wait"
+            self._find_wait_query = arg.strip('"')
+            self._find_wait_attempts = 0
+            self._find_wait_max = 10  # max retries (10 * 1s = 10s timeout)
+            self._handle_find(self._find_wait_query)
         elif name == "find-image":
             self._macro_wait_reason = "find-image"
             self._find_image(arg)
+        elif name == "find-mrn":
+            self._macro_wait_reason = "find-mrn"
+            self._handle_find_mrn()
         elif name == "wait":
             self._execute_wait(arg)
         elif name == "smart-click":
@@ -1633,11 +2451,19 @@ class AppController(AppKit.NSObject):
             self._execute_click_at(arg, button="left")
         elif name == "rclick-at":
             self._execute_click_at(arg, button="right")
+        elif name == "click-relative":
+            self._execute_click_relative(arg)
         elif name == "smart-dclick":
             self._macro_wait_reason = "smart-click"
             self._execute_smart_click(arg, button="left", click_count=2)
         elif name == "dclick-at":
             self._execute_click_at(arg, button="left", click_count=2)
+        elif name == "key-press":
+            self._execute_key_press(arg)
+        elif name == "type":
+            self._execute_type(arg)
+        elif name == "type-keys":
+            self._execute_type_keys(arg)
         else:
             self._abort_macro(f"Unknown step: {step}")
 
@@ -1655,6 +2481,7 @@ class AppController(AppKit.NSObject):
             self._macro_wait_reason = None
             self._macro_root = None
             self._macro_stack = []
+            self.command_bar.show()
         if message:
             self.command_bar.set_status(message)
 
@@ -1684,12 +2511,412 @@ class AppController(AppKit.NSObject):
         if self._macro_wait_reason == "wait":
             self._macro_step_complete()
 
+    def findWaitRetryFired_(self, timer):
+        """Retry find-wait: re-capture screen and search again."""
+        if self._macro_wait_reason != "find-wait":
+            return
+        self._handle_find(self._find_wait_query)
+
+    # Map key names to macOS virtual key codes
+    _KEY_PRESS_SPECS = {
+        "down": (125, 0),
+        "up": (126, 0),
+        "left": (123, 0),
+        "right": (124, 0),
+        "page-down": (121, 0),
+        "page-up": (116, 0),
+        "line-start": (123, Quartz.kCGEventFlagMaskCommand),
+        "line-end": (124, Quartz.kCGEventFlagMaskCommand),
+        "text-start": (0, Quartz.kCGEventFlagMaskControl),
+        "text-end": (14, Quartz.kCGEventFlagMaskControl),
+        "ctrl-a": (0, Quartz.kCGEventFlagMaskControl),
+        "ctrl-e": (14, Quartz.kCGEventFlagMaskControl),
+        "cmd-left": (123, Quartz.kCGEventFlagMaskCommand),
+        "cmd-right": (124, Quartz.kCGEventFlagMaskCommand),
+        "command-left": (123, Quartz.kCGEventFlagMaskCommand),
+        "command-right": (124, Quartz.kCGEventFlagMaskCommand),
+    }
+
+    _KEY_PRESS_SYSTEM_EVENTS = {
+        "up-se": (126, []),
+        "down-se": (125, []),
+        "left-se": (123, []),
+        "right-se": (124, []),
+        "text-start-se": (0, ["control down"]),
+        "text-end-se": (14, ["control down"]),
+        "ctrl-a-se": (0, ["control down"]),
+        "ctrl-e-se": (14, ["control down"]),
+    }
+
+    _TYPE_KEYCODES = {
+        "a": 0,
+        "s": 1,
+        "d": 2,
+        "f": 3,
+        "h": 4,
+        "g": 5,
+        "z": 6,
+        "x": 7,
+        "c": 8,
+        "v": 9,
+        "b": 11,
+        "q": 12,
+        "w": 13,
+        "e": 14,
+        "r": 15,
+        "y": 16,
+        "t": 17,
+        "1": 18,
+        "2": 19,
+        "3": 20,
+        "4": 21,
+        "6": 22,
+        "5": 23,
+        "=": 24,
+        "9": 25,
+        "7": 26,
+        "-": 27,
+        "8": 28,
+        "0": 29,
+        "]": 30,
+        "o": 31,
+        "u": 32,
+        "[": 33,
+        "i": 34,
+        "p": 35,
+        "l": 37,
+        "j": 38,
+        "'": 39,
+        "k": 40,
+        ";": 41,
+        "\\": 42,
+        ",": 43,
+        "/": 44,
+        "n": 45,
+        "m": 46,
+        ".": 47,
+        "`": 50,
+        " ": 49,
+    }
+
+    _TYPE_SHIFTED = {
+        "_": "-",
+        "+": "=",
+        ")": "0",
+        "(": "9",
+        "*": "8",
+        "&": "7",
+        "^": "6",
+        "%": "5",
+        "$": "4",
+        "#": "3",
+        "@": "2",
+        "!": "1",
+        "}": "]",
+        "{": "[",
+        ":": ";",
+        "\"": "'",
+        "|": "\\",
+        "<": ",",
+        ">": ".",
+        "?": "/",
+        "~": "`",
+    }
+
+    def _execute_key_press(self, arg):
+        """Execute a key-press step during macro playback."""
+        parts = arg.strip().lower().split()
+        if not parts:
+            self._abort_macro("Unknown key: ")
+            return
+        key_name = parts[0]
+        repeat = 1
+        if len(parts) >= 2:
+            try:
+                repeat = max(1, min(100, int(parts[1])))
+            except ValueError:
+                self._abort_macro(f"Invalid key repeat: {arg}")
+                return
+
+        system_spec = self._KEY_PRESS_SYSTEM_EVENTS.get(key_name)
+        if system_spec is not None:
+            key_code, modifiers = system_spec
+            mods = f" using {{{', '.join(modifiers)}}}" if modifiers else ""
+            if repeat == 1:
+                script = f'tell application "System Events" to key code {key_code}{mods}'
+            else:
+                script = (
+                    'tell application "System Events"\n'
+                    f'  repeat {repeat} times\n'
+                    f'    key code {key_code}{mods}\n'
+                    '    delay 0.02\n'
+                    '  end repeat\n'
+                    'end tell'
+                )
+            print(
+                f"DEBUG _execute_key_press: pressing {arg} via System Events "
+                f"(code={key_code}, modifiers={modifiers}, repeat={repeat})"
+            )
+            try:
+                subprocess.run(["osascript", "-e", script], check=True)
+            except Exception as exc:
+                self._abort_macro(f"Key press failed: {arg} ({exc})")
+                return
+            self._macro_step_complete()
+            return
+
+        key_spec = self._KEY_PRESS_SPECS.get(key_name)
+        if key_spec is None:
+            self._abort_macro(f"Unknown key: {arg}")
+            return
+        key_code, flags = key_spec
+        print(f"DEBUG _execute_key_press: pressing {arg} (code={key_code}, flags={flags}, repeat={repeat})")
+        for _ in range(repeat):
+            event_down = Quartz.CGEventCreateKeyboardEvent(None, key_code, True)
+            event_up = Quartz.CGEventCreateKeyboardEvent(None, key_code, False)
+            if flags:
+                Quartz.CGEventSetFlags(event_down, flags)
+                Quartz.CGEventSetFlags(event_up, flags)
+            Quartz.CGEventPost(Quartz.kCGHIDEventTap, event_down)
+            Quartz.CGEventPost(Quartz.kCGHIDEventTap, event_up)
+            if repeat > 1:
+                time.sleep(0.02)
+        self._macro_step_complete()
+
+    def _capture_active_screen_bgr(self):
+        image, width_px, height_px, scale, _bounds_px = self.ocr_engine.capture_display(
+            self._active_display_id,
+            (self.screen_frame.size.width, self.screen_frame.size.height),
+        )
+        bytes_per_row = Quartz.CGImageGetBytesPerRow(image)
+        data_provider = Quartz.CGImageGetDataProvider(image)
+        data = Quartz.CGDataProviderCopyData(data_provider)
+        arr = np.frombuffer(data, dtype=np.uint8)
+        arr = arr.reshape((height_px, bytes_per_row // 4, 4))
+        screen_bgr = arr[:, :width_px, :3].copy()
+        return image, screen_bgr, width_px, height_px, scale
+
+    def _save_button_state(self):
+        """Return True when a visible Save button looks enabled, False when it looks disabled, or None if undetermined."""
+        try:
+            image, screen_bgr, width_px, height_px, scale = self._capture_active_screen_bgr()
+            items = self.ocr_engine.recognize_text(image, width_px, height_px, scale)
+        except Exception as exc:
+            print(f"DEBUG _save_button_state: capture failed: {exc}")
+            return None
+
+        save_matches = []
+        for item in items:
+            text = item["text"].strip()
+            norm = re.sub(r"[^a-z]", "", text.lower())
+            if norm != "save":
+                continue
+            x, y, w, h = item["bbox"]
+            if y < self.screen_frame.size.height * 0.25:
+                continue
+            if w > self.screen_frame.size.width * 0.15:
+                continue
+            if h > self.screen_frame.size.height * 0.08:
+                continue
+            save_matches.append({"text": text, "bbox": item["bbox"]})
+        if not save_matches:
+            for item in items:
+                text = item["text"].strip()
+                norm = re.sub(r"[^a-z]", "", text.lower())
+                if norm != "cancel":
+                    continue
+                x, y, w, h = item["bbox"]
+                if y < self.screen_frame.size.height * 0.25:
+                    continue
+                inferred_bbox = (x + (w * 2.35), y, w, h)
+                save_matches.append({"text": "Save(inferred)", "bbox": inferred_bbox})
+        if not save_matches:
+            print("DEBUG _save_button_state: no Save text found")
+            return None
+
+        def save_sort_key(item):
+            x, y, w, h = item["bbox"]
+            cx = x + (w / 2.0)
+            cy = y + (h / 2.0)
+            dx = cx - self.screen_center[0]
+            dy = cy - (self.screen_center[1] + self.screen_frame.size.height * 0.1)
+            return (dx * dx + dy * dy, -y)
+
+        save_matches = sorted(save_matches, key=save_sort_key)
+        x, y, w, h = save_matches[0]["bbox"]
+        pad_x = max(w * 1.1, 22.0)
+        pad_y = max(h * 1.4, 18.0)
+        x0 = max(0, int((x - pad_x) * scale))
+        y0 = max(0, int((y - pad_y) * scale))
+        x1 = min(width_px, int((x + w + pad_x) * scale))
+        y1 = min(height_px, int((y + h + pad_y) * scale))
+        if x1 <= x0 or y1 <= y0:
+            return None
+
+        roi = screen_bgr[y0:y1, x0:x1]
+        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        blue_mask = (
+            (hsv[:, :, 0] >= 95) &
+            (hsv[:, :, 0] <= 130) &
+            (hsv[:, :, 1] >= 60) &
+            (hsv[:, :, 2] >= 80)
+        )
+        blue_ratio = float(np.mean(blue_mask))
+        sat_mean = float(np.mean(hsv[:, :, 1]))
+        enabled = blue_ratio >= 0.05 or sat_mean >= 40.0
+        print(
+            f"DEBUG _save_button_state: text='{save_matches[0]['text']}', "
+            f"blue_ratio={blue_ratio:.3f}, sat_mean={sat_mean:.1f}, enabled={enabled}"
+        )
+        return enabled
+
+    def _wait_for_save_enabled(self, timeout=1.5, interval=0.15):
+        deadline = time.time() + timeout
+        saw_disabled = False
+        while time.time() < deadline:
+            state = self._save_button_state()
+            if state is True:
+                return True
+            if state is False:
+                saw_disabled = True
+            time.sleep(interval)
+        if saw_disabled:
+            return False
+        return None
+
+    def _type_via_keycodes(self, text, delay=0.01):
+        for ch in text:
+            base = ch
+            needs_shift = False
+            if ch.isalpha() and ch.upper() == ch:
+                base = ch.lower()
+                needs_shift = True
+            elif ch in self._TYPE_SHIFTED:
+                base = self._TYPE_SHIFTED[ch]
+                needs_shift = True
+
+            key_code = self._TYPE_KEYCODES.get(base)
+            if key_code is None:
+                self._abort_macro(f"Unsupported typed character: {ch!r}")
+                return
+
+            event_down = Quartz.CGEventCreateKeyboardEvent(None, key_code, True)
+            if needs_shift:
+                Quartz.CGEventSetFlags(event_down, Quartz.kCGEventFlagMaskShift)
+            Quartz.CGEventPost(Quartz.kCGHIDEventTap, event_down)
+            event_up = Quartz.CGEventCreateKeyboardEvent(None, key_code, False)
+            if needs_shift:
+                Quartz.CGEventSetFlags(event_up, Quartz.kCGEventFlagMaskShift)
+            Quartz.CGEventPost(Quartz.kCGHIDEventTap, event_up)
+            time.sleep(delay)
+
+    def _type_via_paste(self, text):
+        pb = AppKit.NSPasteboard.generalPasteboard()
+        pb.clearContents()
+        pb.setString_forType_(text, AppKit.NSPasteboardTypeString)
+
+        cmd_down = Quartz.CGEventCreateKeyboardEvent(None, 55, True)
+        v_down = Quartz.CGEventCreateKeyboardEvent(None, 9, True)
+        v_up = Quartz.CGEventCreateKeyboardEvent(None, 9, False)
+        cmd_up = Quartz.CGEventCreateKeyboardEvent(None, 55, False)
+        Quartz.CGEventPost(Quartz.kCGHIDEventTap, cmd_down)
+        time.sleep(0.01)
+        Quartz.CGEventPost(Quartz.kCGHIDEventTap, v_down)
+        time.sleep(0.01)
+        Quartz.CGEventPost(Quartz.kCGHIDEventTap, v_up)
+        time.sleep(0.01)
+        Quartz.CGEventPost(Quartz.kCGHIDEventTap, cmd_up)
+
+    def _type_via_system_events(self, text):
+        escaped = text.replace("\\", "\\\\").replace('"', '\\"')
+        script = f'tell application "System Events" to keystroke "{escaped}"'
+        subprocess.run(["osascript", "-e", script], check=True)
+
+    def _execute_type(self, arg, allow_paste=True):
+        """Type text and verify it by checking whether Save becomes enabled."""
+        import datetime
+        text = arg.strip('"')
+        today = datetime.date.today().strftime("%m/%d/%Y")
+        text = text.replace("{date}", today)
+        text_len = len(text)
+
+        attempts = []
+        if allow_paste:
+            attempts.append(("paste", lambda: self._type_via_paste(text)))
+        attempts.extend([
+            ("system-events", lambda: self._type_via_system_events(text)),
+            ("keycodes", lambda: self._type_via_keycodes(text, delay=0.01)),
+            ("keycodes-slow", lambda: self._type_via_keycodes(text, delay=0.04)),
+        ])
+        final_state = None
+
+        for label, sender in attempts:
+            print(f"DEBUG _execute_type: trying {label} (len={text_len})")
+            try:
+                sender()
+            except Exception as exc:
+                print(f"DEBUG _execute_type: {label} failed (len={text_len}): {exc}")
+                continue
+            state = self._wait_for_save_enabled()
+            final_state = state
+            if state is True:
+                print(f"DEBUG _execute_type: {label} succeeded (len={text_len})")
+                self._macro_step_complete()
+                return
+            if state is False:
+                print(f"DEBUG _execute_type: {label} did not enable Save (len={text_len})")
+            else:
+                print(f"DEBUG _execute_type: {label} sent text, Save state unknown (len={text_len})")
+
+        if final_state is False:
+            self._abort_macro("type failed: Save stayed disabled")
+            return
+        self._abort_macro("type failed: could not verify Save")
+
+    def _execute_type_keys(self, arg):
+        """Type text once using keyboard-style input only, without paste or Save-state retries."""
+        import datetime
+        text = arg.strip('"')
+        today = datetime.date.today().strftime("%m/%d/%Y")
+        text = text.replace("{date}", today)
+        text_len = len(text)
+
+        print(f"DEBUG _execute_type_keys: trying system-events (len={text_len})")
+        try:
+            self._type_via_system_events(text)
+            self._macro_step_complete()
+            return
+        except Exception as exc:
+            print(f"DEBUG _execute_type_keys: system-events failed (len={text_len}): {exc}")
+
+        print(f"DEBUG _execute_type_keys: falling back to keycodes (len={text_len})")
+        self._type_via_keycodes(text, delay=0.03)
+        self._macro_step_complete()
+
     def _execute_smart_click(self, arg, button="left", click_count=1):
         """Execute a smart-click command during macro playback.
 
-        Format: smart-click "query" xPct yPct [--allow-fallback]
+        Format: smart-click "query" xPct yPct [--allow-fallback] [--wait [seconds]] [--attempts N]
         """
-        # Parse the command
+        # Parse flags first, then parse the core smart-click args.
+        wait_seconds = 0.0
+        wait_match = re.search(r"--wait(?:\s+(\d+(?:\.\d+)?))?", arg)
+        if wait_match:
+            try:
+                wait_seconds = float(wait_match.group(1) or "10")
+            except ValueError:
+                wait_seconds = 10.0
+            arg = (arg[:wait_match.start()] + arg[wait_match.end():]).strip()
+
+        click_attempts = 1
+        attempts_match = re.search(r"--attempts\s+(\d+)", arg)
+        if attempts_match:
+            try:
+                click_attempts = max(1, min(5, int(attempts_match.group(1))))
+            except ValueError:
+                click_attempts = 1
+            arg = (arg[:attempts_match.start()] + arg[attempts_match.end():]).strip()
+
         allow_fallback = "--allow-fallback" in arg
         arg_clean = arg.replace("--allow-fallback", "").strip()
 
@@ -1699,7 +2926,7 @@ class AppController(AppKit.NSObject):
             self._abort_macro(f"Invalid smart-click: {arg}")
             return
 
-        self.command_bar.set_status(f"Finding '{query}'...")
+        self.command_bar.set_status("Finding text...")
 
         # Run capture + OCR + find (async)
         self._smart_click_query = query
@@ -1708,10 +2935,24 @@ class AppController(AppKit.NSObject):
         self._smart_click_button = button
         self._smart_click_allow_fallback = allow_fallback
         self._smart_click_count = click_count
+        self._smart_click_attempts = click_attempts
+        self._smart_click_wait_until = (time.time() + wait_seconds) if wait_seconds > 0 else None
+        self._smart_click_retry_count = 0
 
         # Trigger find, which will call _smart_click_after_find when done
         self._pending_find_query = query
         self._handle_capture()
+
+    def _clear_smart_click_state(self):
+        self._smart_click_query = None
+        self._smart_click_x_pct = None
+        self._smart_click_y_pct = None
+        self._smart_click_button = None
+        self._smart_click_allow_fallback = None
+        self._smart_click_count = None
+        self._smart_click_attempts = None
+        self._smart_click_wait_until = None
+        self._smart_click_retry_count = 0
 
     def _parse_smart_click_args(self, arg):
         """Parse smart-click arguments: "query" xPct yPct"""
@@ -1784,6 +3025,72 @@ class AppController(AppKit.NSObject):
         self._click_at(click_x, click_y, button, click_count)
         self._macro_step_complete()
 
+    def _execute_click_relative(self, arg):
+        """Click relative to an existing OCR/image match.
+
+        Format: click-relative index dx dy
+        where dx and dy are offsets in units of the matched bbox width/height.
+        Example: click-relative 1 -0.5 6.0
+        """
+        parts = arg.strip().split()
+        if len(parts) < 3:
+            self._abort_macro(f"Invalid click-relative: {arg}")
+            return
+
+        try:
+            index = int(parts[0])
+            dx = float(parts[1])
+            dy = float(parts[2])
+        except ValueError:
+            self._abort_macro(f"Invalid click-relative args: {arg}")
+            return
+
+        if index < 1 or index > len(self.matches):
+            self._abort_macro(f"click-relative {index}: no match (only {len(self.matches)} found)")
+            return
+
+        match = self.matches[index - 1]
+        x, y, w, h = match["bbox"]
+        anchor_x = x + (w / 2.0)
+        anchor_y = y + (h / 2.0)
+        click_x = anchor_x + (dx * w)
+        click_y = anchor_y + (dy * h)
+        print(
+            f"DEBUG _execute_click_relative: index={index}, anchor=({anchor_x:.1f}, {anchor_y:.1f}), "
+            f"offset=({dx:.3f}w, {dy:.3f}h), click=({click_x:.1f}, {click_y:.1f})"
+        )
+        self._dispatch_macro_click(
+            click_x,
+            click_y,
+            button="left",
+            click_count=1,
+            reason="click-relative-click",
+            attempts=1,
+        )
+
+    def _dispatch_macro_click(self, x, y, button="left", click_count=1, reason="macro-click", attempts=None):
+        """Dispatch a macro click on the next runloop cycle."""
+        if attempts is None:
+            attempts = 1
+
+        self.last_click_point = (x, y)
+        self.overlay.clear()
+        self.matches = []
+        self._macro_wait_reason = reason
+
+        def _do_click():
+            print(
+                f"DEBUG {reason}: dispatching {button} click_count={click_count} "
+                f"at ({x:.1f}, {y:.1f}), attempts={attempts}"
+            )
+            for attempt in range(attempts):
+                self._click_at(x, y, button=button, click_count=click_count)
+                if attempt + 1 < attempts:
+                    time.sleep(0.3)
+            self._macro_step_complete()
+
+        run_on_main(_do_click)
+
     def _smart_click_after_find(self):
         """Called after OCR completes to finish smart-click execution."""
         query = getattr(self, "_smart_click_query", None)
@@ -1792,29 +3099,43 @@ class AppController(AppKit.NSObject):
         button = getattr(self, "_smart_click_button", "left")
         allow_fallback = getattr(self, "_smart_click_allow_fallback", False)
         click_count = getattr(self, "_smart_click_count", 1)
-
-        # Clear state
-        self._smart_click_query = None
-        self._smart_click_x_pct = None
-        self._smart_click_y_pct = None
-        self._smart_click_button = None
-        self._smart_click_allow_fallback = None
-        self._smart_click_count = None
+        click_attempts = getattr(self, "_smart_click_attempts", 1) or 1
+        wait_until = getattr(self, "_smart_click_wait_until", None)
+        retry_count = getattr(self, "_smart_click_retry_count", 0)
 
         if not self.matches:
             # No matches found
+            if wait_until is not None and time.time() < wait_until:
+                self._smart_click_retry_count = retry_count + 1
+                print(f"DEBUG _smart_click_after_find: no match, retry {self._smart_click_retry_count}")
+
+                def _retry():
+                    AppKit.NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+                        0.5, self, "smartClickRetryFired:", None, False
+                    )
+
+                run_on_main(_retry)
+                return
             if allow_fallback and x_pct is not None and y_pct is not None:
                 # Fallback to coordinate click
-                self.command_bar.set_status(f"'{query}' not found, using coordinates")
+                self.command_bar.set_status("Text not found, using coordinates")
                 target_x = x_pct * self.screen_frame.size.width
                 target_y = y_pct * self.screen_frame.size.height
-                self._click_at(target_x, target_y, button=button, click_count=click_count)
-                self.last_click_point = (target_x, target_y)
-                self._macro_step_complete()
+                self._clear_smart_click_state()
+                self._dispatch_macro_click(
+                    target_x,
+                    target_y,
+                    button=button,
+                    click_count=click_count,
+                    attempts=click_attempts,
+                    reason="smart-click-fallback",
+                )
+                return
             else:
                 # Safe fallback: stop macro
-                self._abort_macro(f"Text '{query}' not found - macro stopped")
-            return
+                self._clear_smart_click_state()
+                self._abort_macro("Text not found - macro stopped")
+                return
 
         if len(self.matches) == 1 or x_pct is None or y_pct is None:
             # Single match or no coordinates - click first match
@@ -1830,20 +3151,36 @@ class AppController(AppKit.NSObject):
                 cy = y + (h / 2.0)
                 return (cx - target_x) ** 2 + (cy - target_y) ** 2
 
-            match = min(self.matches, key=distance_to_target)
+            match = min(
+                self.matches,
+                key=lambda m: (m.get("find_priority", (9, 9, 9, 999999)), distance_to_target(m)),
+            )
 
         # Click the match
         bbox = match["bbox"]
         x, y, w, h = bbox
         cx = x + (w / 2.0)
         cy = y + (h / 2.0)
+        exact = self._normalize_find_text(match.get("text", "")) == self._normalize_find_text(query or "")
+        print(f"DEBUG _smart_click_after_find: selected match at ({cx:.1f}, {cy:.1f}), exact={exact}")
+        self._clear_smart_click_state()
+        self._dispatch_macro_click(
+            cx,
+            cy,
+            button=button,
+            click_count=click_count,
+            attempts=click_attempts,
+            reason="smart-click-click",
+        )
 
-        self._click_at(cx, cy, button=button, click_count=click_count)
-        self.last_click_point = (cx, cy)
-        self.overlay.clear()
-        self.matches = []
-
-        self._macro_step_complete()
+    def smartClickRetryFired_(self, timer):
+        if self._macro_wait_reason != "smart-click":
+            return
+        query = getattr(self, "_smart_click_query", None)
+        if not query:
+            return
+        self._pending_find_query = query
+        self._handle_capture()
 
     def _anchor_point(self):
         if self.last_click_point is not None:
@@ -1861,7 +3198,7 @@ class AppController(AppKit.NSObject):
             cy = y + (h / 2.0)
             dx = cx - anchor_x
             dy = cy - anchor_y
-            return (dx * dx + dy * dy, y, x)
+            return (item.get("find_priority", (0, 0, 0, 0)), dx * dx + dy * dy, y, x)
 
         return sorted(matches, key=sort_key)
 
@@ -1909,6 +3246,7 @@ class AppController(AppKit.NSObject):
         self._key_monitor = None
 
     def handle_command(self, text):
+        self._reload_macros_if_changed()
         command = text.strip()
         if not command:
             return
@@ -1947,10 +3285,15 @@ class AppController(AppKit.NSObject):
             self._run_macro(arg)
         elif name == "macros":
             self._list_macros()
+        elif name == "edit":
+            self._open_macro_editor(arg)
         elif name == "show":
             self._show_macro(arg)
         elif name == "delete":
             self._delete_macro(arg)
+        elif name == "find-mrn":
+            self._sync_active_screen_to_command_bar(announce=False)
+            self._handle_find_mrn()
         elif name == "capture-image":
             self._sync_active_screen_to_command_bar(announce=False)
             self._capture_image(arg)
@@ -1979,8 +3322,10 @@ class AppController(AppKit.NSObject):
                 "stop  - save recording\n"
                 "run <name>  - run macro\n"
                 "macros  - list macros\n"
+                "edit [name]  - open macro editor GUI\n"
                 "show <name>  - show macro steps\n"
                 "delete <name>  - remove macro\n"
+                "find-mrn  - find MRN on screen and copy to clipboard\n"
                 "capture-image <name>  - save region (recording)\n"
                 "find-image <name>  - find image (macro)\n"
                 "images  - list saved images\n"
@@ -2116,8 +3461,70 @@ class AppController(AppKit.NSObject):
 
         threading.Thread(target=task, daemon=True).start()
 
+    def _handle_find_mrn(self):
+        """Capture screen, OCR it, find MRN pattern, copy to clipboard."""
+        if self._ocr_in_progress:
+            self.command_bar.set_status("OCR already in progress")
+            return
+        self._ocr_in_progress = True
+        self.command_bar.set_status("Capturing for MRN...")
+
+        def task():
+            with objc.autorelease_pool():
+                try:
+                    image, width_px, height_px, scale, bounds_px = (
+                        self.ocr_engine.capture_display(
+                            self._active_display_id,
+                            (self.screen_frame.size.width, self.screen_frame.size.height),
+                        )
+                    )
+                except Exception as exc:
+                    print(f"MRN capture failed: {exc}")
+                    run_on_main(lambda: self.command_bar.set_status("Capture failed"))
+                    self._ocr_in_progress = False
+                    if self._macro_wait_reason == "find-mrn":
+                        run_on_main(lambda: self._abort_macro("Capture failed"))
+                    return
+
+                run_on_main(lambda: self.command_bar.set_status("Running OCR for MRN..."))
+                try:
+                    items = self.ocr_engine.recognize_text(image, width_px, height_px, scale)
+                except Exception as exc:
+                    print(f"MRN OCR failed: {exc}")
+                    run_on_main(lambda: self.command_bar.set_status("OCR failed"))
+                    self._ocr_in_progress = False
+                    if self._macro_wait_reason == "find-mrn":
+                        run_on_main(lambda: self._abort_macro("OCR failed"))
+                    return
+
+            # Concatenate all OCR text and search for MRN pattern.
+            # OCR may split "MRN: 12345" across items, so join everything with a space.
+            full_text = " ".join(item["text"] for item in items)
+            # Pattern: MRN optionally followed by colon/space(s), then digits (5-12 digits)
+            match = re.search(r'MRN[:\s]*(\d{5,12})', full_text, re.IGNORECASE)
+
+            def finish():
+                self._ocr_in_progress = False
+                if match:
+                    mrn_number = match.group(1)
+                    pb = AppKit.NSPasteboard.generalPasteboard()
+                    pb.clearContents()
+                    pb.setString_forType_(mrn_number, AppKit.NSPasteboardTypeString)
+                    self.command_bar.set_status(f"MRN copied: {mrn_number}")
+                else:
+                    self.command_bar.set_status("MRN not found on screen")
+                if self._macro_wait_reason == "find-mrn":
+                    self._macro_step_complete()
+
+            run_on_main(finish)
+
+        threading.Thread(target=task, daemon=True).start()
+
     def _handle_find(self, query):
         self._sync_active_screen_to_command_bar(announce=False)
+        # Strip surrounding quotes if present
+        if len(query) >= 2 and query[0] == '"' and query[-1] == '"':
+            query = query[1:-1]
         if not query:
             self.command_bar.set_status("Missing search text")
             return
@@ -2128,16 +3535,49 @@ class AppController(AppKit.NSObject):
         self._pending_find_query = query
         self._handle_capture()
 
+    def _normalize_find_text(self, text):
+        return re.sub(r"\s+", " ", (text or "").strip()).lower()
+
+    def _is_find_noise_text(self, text):
+        norm = self._normalize_find_text(text)
+        if not norm:
+            return True
+        if norm.startswith("debug ") or norm.startswith("macro step:"):
+            return True
+        markers = (
+            "_run_find",
+            "_smart_click_after_find",
+            "ocr_items=",
+            "matches=",
+            "query='",
+            'query="',
+            "click_count=",
+            "queue=",
+            "remaining)",
+            "dispatching",
+        )
+        return any(marker in norm for marker in markers)
+
+    def _find_match_priority(self, text, query):
+        norm_text = self._normalize_find_text(text)
+        norm_query = self._normalize_find_text(query)
+        exact_penalty = 0 if norm_text == norm_query else 1
+        prefix_penalty = 0 if norm_text.startswith(norm_query) else 1
+        whole_penalty = 0 if re.search(rf"(^|[^a-z0-9]){re.escape(norm_query)}([^a-z0-9]|$)", norm_text) else 1
+        length_penalty = max(0, len(norm_text) - len(norm_query))
+        return (exact_penalty, prefix_penalty, whole_penalty, length_penalty)
+
     def _run_find(self, query):
         if not query:
             self.command_bar.set_status("Missing search text")
             return
 
-        norm_query = query.lower()
         matches = []
         ns_query = Foundation.NSString.stringWithString_(query)
         for item in self.ocr_items:
             text = item["text"]
+            if self._is_find_noise_text(text):
+                continue
             ns_full = Foundation.NSString.stringWithString_(text)
             search_range = Foundation.NSMakeRange(0, ns_full.length())
             while True:
@@ -2149,7 +3589,12 @@ class AppController(AppKit.NSObject):
                 bbox = self._bbox_for_text_range(item, found)
                 if bbox is None:
                     bbox = item["bbox"]
-                matches.append({"text": text, "bbox": bbox, "query": query})
+                matches.append({
+                    "text": text,
+                    "bbox": bbox,
+                    "query": query,
+                    "find_priority": self._find_match_priority(text, query),
+                })
                 next_location = found.location + max(found.length, 1)
                 if next_location >= ns_full.length():
                     break
@@ -2157,10 +3602,36 @@ class AppController(AppKit.NSObject):
                     next_location, ns_full.length() - next_location
                 )
         matches = self._order_matches_by_anchor(matches)
-        self.matches = matches
-        self.overlay.show_matches(matches, self.screen_height)
-        self.command_bar.set_status(f"Found {len(matches)} matches")
-        if self._macro_wait_reason == "find":
+        passive_wait = self._macro_wait_reason == "find-wait"
+        if passive_wait:
+            self.matches = []
+            self.overlay.clear()
+        else:
+            self.matches = matches
+            self.overlay.show_matches(matches, self.screen_height)
+        print(f"DEBUG _run_find: query_len={len(query)}, ocr_items={len(self.ocr_items)}, matches={len(matches)}")
+        if passive_wait:
+            self.command_bar.set_status(
+                "Ready" if matches else "Waiting for text..."
+            )
+        else:
+            self.command_bar.set_status(f"Found {len(matches)} matches")
+        if self._macro_wait_reason == "find-wait":
+            if matches:
+                self._macro_step_complete()
+            else:
+                self._find_wait_attempts += 1
+                if self._find_wait_attempts >= self._find_wait_max:
+                    self._abort_macro("find-wait timeout: text not found")
+                else:
+                    print(f"DEBUG find-wait: no match, retry {self._find_wait_attempts}/{self._find_wait_max}")
+                    self.command_bar.set_status("Waiting for text...")
+                    def _retry():
+                        AppKit.NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+                            1.0, self, "findWaitRetryFired:", None, False
+                        )
+                    run_on_main(_retry)
+        elif self._macro_wait_reason == "find":
             self._macro_step_complete()
         elif self._macro_wait_reason == "smart-click":
             self._smart_click_after_find()
@@ -2203,7 +3674,10 @@ class AppController(AppKit.NSObject):
             self.command_bar.set_status("Invalid selection")
             return
         if index < 1 or index > len(self.matches):
-            self.command_bar.set_status("Invalid selection")
+            if self._macro_running:
+                self._abort_macro(f"click {index}: no match (only {len(self.matches)} found)")
+            else:
+                self.command_bar.set_status("Invalid selection")
             return
 
         match = self.matches[index - 1]
@@ -2222,11 +3696,13 @@ class AppController(AppKit.NSObject):
             name = "click" if button == "left" else "rclick"
             self._record_step(f"{name} {index}")
 
-        self._click_at(cx, cy, button=button)
         self.last_click_point = (cx, cy)
         self.overlay.clear()
         self.matches = []
         self.command_bar.hide()
+        self._click_at(cx, cy, button=button)
+        if self._macro_running:
+            self._macro_step_complete()
 
     def _record_smart_click(self, match, cx, cy, button="left"):
         """Record a smart-click step with query text and normalized coordinates."""
@@ -2260,11 +3736,68 @@ class AppController(AppKit.NSObject):
         # Update last action time
         self._recording_last_action_time = time.time()
 
+    def _capture_click_region(self, cx, cy, radius_pt=80):
+        """Capture a small region around (cx, cy) in points. Returns grayscale numpy array or None."""
+        try:
+            display_id = self._active_display_id
+            scale = Quartz.CGDisplayBounds(display_id).size.width / self.screen_frame.size.width
+            ox, oy = getattr(self, "capture_origin_pt", (0.0, 0.0))
+            # Build pixel rect centered on click point
+            px = (ox + cx - radius_pt) * scale
+            py = (oy + cy - radius_pt) * scale
+            pw = radius_pt * 2 * scale
+            ph = radius_pt * 2 * scale
+            rect = Quartz.CGRectMake(px, py, pw, ph)
+            img = Quartz.CGDisplayCreateImageForRect(display_id, rect)
+            if img is None:
+                return None
+            w = Quartz.CGImageGetWidth(img)
+            h = Quartz.CGImageGetHeight(img)
+            bpr = Quartz.CGImageGetBytesPerRow(img)
+            data = Quartz.CGDataProviderCopyData(Quartz.CGImageGetDataProvider(img))
+            arr = np.frombuffer(data, dtype=np.uint8).reshape((h, bpr // 4, 4))
+            return arr[:, :w, :3].mean(axis=2).astype(np.float32)
+        except Exception as e:
+            print(f"DEBUG _capture_click_region: failed: {e}")
+            return None
+
+    def clickVerifyTimerFired_(self, timer):
+        """After 0.5s, check if click registered; retry once if screen unchanged."""
+        if self._macro_wait_reason != "click-verify":
+            return
+        cx = getattr(self, "_click_verify_x", None)
+        cy = getattr(self, "_click_verify_y", None)
+        button = getattr(self, "_click_verify_button", "left")
+        pre = getattr(self, "_click_verify_pre", None)
+        self._click_verify_pre = None
+
+        if cx is not None and pre is not None:
+            post = self._capture_click_region(cx, cy)
+            if post is not None and post.shape == pre.shape:
+                diff = float(np.mean(np.abs(post - pre)))
+                print(f"DEBUG clickVerify: diff={diff:.2f}")
+                if diff < 2.0:
+                    print(f"DEBUG clickVerify: no change detected, retrying click at ({cx:.1f}, {cy:.1f})")
+                    self._click_at(cx, cy, button=button)
+                else:
+                    print(f"DEBUG clickVerify: change detected, click registered")
+            else:
+                print(f"DEBUG clickVerify: could not compare regions")
+
+        self._macro_step_complete()
+
     def _click_at(self, x, y, button="left", click_count=1):
         # `x,y` are in points relative to the *active screen*.
         # Quartz mouse events expect global display coordinates.
         ox, oy = getattr(self, "capture_origin_pt", (0.0, 0.0))
         point = Quartz.CGPointMake(ox + x, oy + y)
+
+        # Move mouse first so the target app registers the cursor position
+        move_event = Quartz.CGEventCreateMouseEvent(
+            None, Quartz.kCGEventMouseMoved, point, Quartz.kCGMouseButtonLeft
+        )
+        Quartz.CGEventPost(Quartz.kCGHIDEventTap, move_event)
+        time.sleep(0.05)
 
         if button == "right":
             down_type = Quartz.kCGEventRightMouseDown
@@ -2283,6 +3816,7 @@ class AppController(AppKit.NSObject):
             Quartz.CGEventSetIntegerValueField(event_down, Quartz.kCGMouseEventClickState, i)
             Quartz.CGEventSetIntegerValueField(event_up, Quartz.kCGMouseEventClickState, i)
             Quartz.CGEventPost(Quartz.kCGHIDEventTap, event_down)
+            time.sleep(0.01)
             Quartz.CGEventPost(Quartz.kCGHIDEventTap, event_up)
 
 

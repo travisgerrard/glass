@@ -1,5 +1,8 @@
 {
   "macros": {
+    "MRN": [
+      "find-mrn"
+    ],
     "Labs": [
       "find Chart",
       "click 1",
@@ -20,12 +23,6 @@
       "click 1"
     ],
     "99214": [
-      "find Chart",
-      "click 1",
-      "find Summary",
-      "click 1",
-      "find Charges",
-      "click 1",
       "find 99214",
       "click 1"
     ],
@@ -82,8 +79,14 @@
       ],
       "steps": [
         "smart-click \"Sign/Submit\" 0.7883 0.9360",
+        "wait 2.0",
+        "smart-click \"Sign\" 0.7712 0.8973",
+        "wait 4.0",
+        "find Charges",
+        "click 1",
         "wait 1.0",
-        "smart-click \"Sign\" 0.7712 0.8973"
+        "find \"E&M Charges\"",
+        "click 1"
       ]
     },
     "s": {
@@ -93,7 +96,7 @@
         982
       ],
       "steps": [
-        "smart-click \"To consumer\" 0.6606 0.2540",
+        "smart-click \"To consumer\" 0.5000 0.5000",
         "wait 1.0",
         "smart-click \"Send\" 0.7211 0.9192",
         "wait 1.5",
@@ -120,6 +123,112 @@
       ],
       "steps": [
         "smart-click \"Delete\" 0.3109 0.2483"
+      ]
+    },
+    "awv4": {
+      "v": 2,
+      "resolution": [
+        1512,
+        982
+      ],
+      "steps": [
+        "wait 3.0",
+        "smart-click \"5 (High) 40 min\" 0.7481 0.5328",
+        "wait 1.5",
+        "smart-click \"25 -Separate E&M, Same MD On Day Of Proc\" 0.6850 0.6768",
+        "wait 0.5",
+        "key-press down",
+        "key-press down",
+        "key-press down",
+        "key-press down",
+        "key-press down",
+        "key-press down",
+        "key-press down",
+        "key-press down",
+        "key-press down",
+        "key-press down",
+        "key-press down",
+        "key-press down",
+        "key-press down",
+        "key-press down",
+        "key-press down",
+        "key-press down",
+        "key-press down",
+        "key-press down",
+        "key-press down",
+        "wait 1.5",
+        "key-press down",
+        "wait 6.5",
+        "smart-click \"G0439 Medicare - Annual Wellness Visit, Subsequent\" 0.9004 0.7526",
+        "wait 7.0",
+        "click-at 0.8180 0.3179"
+      ]
+    },
+    "sf": {
+      "v": 2,
+      "resolution": [
+        1512,
+        982
+      ],
+      "steps": [
+        "smart-click \"POD F Faxes\" 0.3937 0.3751",
+        "wait 2.5",
+        "smart-click \"POD F Faxes\" 0.3937 0.3747",
+        "wait 3.0",
+        "smart-click \"File name:\" 0.1276 0.6301",
+        "wait 4.0",
+        "smart-click \"Save\" 0.4377 0.6970"
+      ]
+    },
+    "fax": {
+      "v": 2,
+      "resolution": [
+        1512,
+        982
+      ],
+      "steps": [
+        "smart-click \"Google Drive /\" 0.48 0.15 --attempts 2",
+        "wait 0.5",
+        "find-image fax_2 --attempts 1",
+        "find-wait \"File name\"",
+        "key-press up-se",
+        "wait 0.2",
+        "type-keys \"2_fax_\""
+      ]
+    },
+    "scan": {
+      "v": 2,
+      "resolution": [
+        1512,
+        982
+      ],
+      "steps": [
+        "smart-click \"Google Drive /\" 0.48 0.15 --attempts 2",
+        "wait 0.5",
+        "find-image fax_2 --attempts 1",
+        "find-wait \"File name\"",
+        "key-press up-se",
+        "wait 0.2",
+        "type-keys \"3_scan_\""
+      ]
+    },
+    "sig": {
+      "v": 2,
+      "resolution": [
+        1512,
+        982
+      ],
+      "steps": [
+        "find-image sig_1 0.05 0.44 --attempts 2",
+        "wait 1.0",
+        "smart-click \"Add signature\" 0.5000 0.5000 --wait 10",
+        "smart-click \"Clear\" 0.9000 0.6400 --wait 10",
+        "wait 0.5",
+        "type-keys \"Travis Gerrard MD, {date}\"",
+        "wait 0.8",
+        "find-wait Clear",
+        "find Clear",
+        "click-relative 1 -0.6500 7.1000"
       ]
     }
   }
